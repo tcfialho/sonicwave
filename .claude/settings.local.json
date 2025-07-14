@@ -17,7 +17,9 @@
       "Bash(rmdir:*)",
       "Bash(rm:*)",
       "Bash(taskkill:*)",
-      "Bash(npm run build:*)"
+      "Bash(npm run build:*)",
+      "Bash(del:*)",
+      "Bash(npm uninstall:*)"
     ],
     "deny": []
   }
