@@ -8,6 +8,8 @@
     let isInitialized = false;
     let isListening = false;
     let selectedProtocol = 'GGWAVE_PROTOCOL_ULTRASONIC_FASTEST';
+    let useCompression = false;
+    let selectedFecScheme = 'BASIC_3';
     let status = 'Ready';
     let receivedMessages: Array<{text: string, timestamp: Date}> = [];
     let availableProtocols: Array<{id: string, name: string, description: string}> = [];
@@ -18,6 +20,32 @@
     let isTransmitting = false;
     let activeTab: 'send' | 'receive' = 'send';
     let showHelpModal = false;
+    
+    // Progress tracking
+    let transmissionProgress = {
+        sessionId: '',
+        totalChunks: 0,
+        currentChunk: 0,
+        phase: 'idle' as 'idle' | 'start' | 'data' | 'parity' | 'end',
+        lastPacket: ''
+    };
+    
+    let receptionProgress = {
+        sessionId: '',
+        totalChunks: 0,
+        receivedChunks: 0,
+        chunks: {} as { [key: number]: boolean },
+        parity: {} as { [key: string]: boolean },
+        phase: 'idle' as 'idle' | 'start' | 'data' | 'parity' | 'end' | 'complete',
+        lastPacket: ''
+    };
+    
+    // Debug information
+    let debugInfo = {
+        totalReceived: 0,
+        totalFailed: 0,
+        sessions: [] as string[]
+    };
 
     onMount(async () => {
         ggwaveService = new GGWaveService();
@@ -67,17 +95,50 @@
         isTransmitting = true;
         
         try {
-            status = '🔄 Encoding text...';
+            status = useCompression ? '🔄 Compressing & transmitting...' : '🔄 Encoding & transmitting...';
             
-            const soundData = await ggwaveService.textToSound(textToSend, selectedProtocol);
+            // Reset progress
+            transmissionProgress = {
+                sessionId: '',
+                totalChunks: 0,
+                currentChunk: 0,
+                phase: 'idle',
+                lastPacket: ''
+            };
             
-            status = '📡 Transmitting sound waves...';
-            await ggwaveService.playSound(soundData);
+            // Get FEC scheme from service
+            const fecScheme = (ggwaveService.constructor as any).FEC_SCHEMES[selectedFecScheme] || (ggwaveService.constructor as any).DEFAULT_FEC_SCHEME;
             
+            await ggwaveService.sendLargeData(textToSend, selectedProtocol, useCompression, fecScheme, (progress) => {
+                transmissionProgress = {
+                    sessionId: progress.sessionId,
+                    totalChunks: progress.total,
+                    currentChunk: progress.current,
+                    phase: progress.type,
+                    lastPacket: progress.packet
+                };
+                
+                if (progress.type === 'start') {
+                    const fecInfo = progress.fecInfo ? ` (FEC: ${progress.fecInfo.scheme})` : '';
+                    status = `🚀 Starting transmission (${progress.total} chunks)${fecInfo}`;
+                } else if (progress.type === 'data') {
+                    status = `📤 Sending chunk ${progress.current}/${progress.total}`;
+                } else if (progress.type === 'parity') {
+                    status = `🔧 Sending parity ${progress.current}/${progress.total}`;
+                } else if (progress.type === 'end') {
+                    status = `🏁 Finalizing transmission`;
+                }
+            });
+
             const protocolName = availableProtocols.find(p => p.id === selectedProtocol)?.name || selectedProtocol;
-            status = `✅ Transmitted using ${protocolName}`;
+            const compressionNote = useCompression ? ' (compressed)' : '';
+            status = `✅ Transmitted using ${protocolName}${compressionNote}`;
+            
+            // Reset progress after completion
+            transmissionProgress.phase = 'idle';
         } catch (error) {
             status = `❌ Transmission failed: ${error}`;
+            transmissionProgress.phase = 'idle';
         } finally {
             isTransmitting = false;
         }
@@ -98,7 +159,38 @@
                 receivedMessages = [message, ...receivedMessages];
                 receivedText = text;
                 
-                status = `📥 Received: "${text}"`;
+                status = `📥 Message received (${text.length} characters)`;
+                
+                // Reset reception progress
+                receptionProgress.phase = 'idle';
+            }, (progress) => {
+                receptionProgress = {
+                    sessionId: progress.sessionId,
+                    totalChunks: progress.total,
+                    receivedChunks: progress.received,
+                    chunks: progress.chunks,
+                    parity: progress.parity,
+                    phase: progress.type,
+                    lastPacket: progress.packet
+                };
+                
+                // Update debug info
+                debugInfo.totalReceived++;
+                if (!debugInfo.sessions.includes(progress.sessionId)) {
+                    debugInfo.sessions.push(progress.sessionId);
+                }
+                
+                if (progress.type === 'start') {
+                    status = `🎯 Receiving transmission (${progress.total} chunks expected)`;
+                } else if (progress.type === 'data') {
+                    status = `📥 Received chunk ${progress.received}/${progress.total}`;
+                } else if (progress.type === 'parity') {
+                    status = `🔧 Received parity data`;
+                } else if (progress.type === 'end') {
+                    status = `🏁 Transmission ending`;
+                } else if (progress.type === 'complete') {
+                    status = `✅ Message reconstructed successfully`;
+                }
             });
         } catch (error) {
             status = `Failed to start listening: ${error}`;
@@ -109,6 +201,12 @@
     function clearReceived() {
         receivedMessages = [];
         receivedText = '';
+        receptionProgress.phase = 'idle';
+        debugInfo = {
+            totalReceived: 0,
+            totalFailed: 0,
+            sessions: []
+        };
     }
 
     function clearTextInput() {
@@ -188,10 +286,9 @@
                             id="textInput"
                             bind:value={textToSend} 
                             placeholder="Enter text to transmit via sound..."
-                            rows="4"
-                            maxlength="140">
+                            rows="4">
                         </textarea>
-                        <small>Maximum 140 characters (ggwave transmission limit) - {textToSend.length}/140</small>
+                        <small>{textToSend.length} characters</small>
                     </div>
                     
                     
@@ -208,6 +305,83 @@
                             {availableProtocols.find(p => p.id === selectedProtocol)?.description || 'Select a protocol'}
                         </small>
                     </div>
+                    
+                    <div class="form-group">
+                        <label class="checkbox-label">
+                            <input type="checkbox" bind:checked={useCompression} />
+                            <span class="checkbox-text">Use gzip compression</span>
+                        </label>
+                        <small>Compress data before transmission (reduces size, increases processing time)</small>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label for="fecScheme">Error Correction (FEC):</label>
+                        <select id="fecScheme" bind:value={selectedFecScheme} class="protocol-select">
+                            <option value="NONE">None - No error correction</option>
+                            <option value="BASIC_2">Basic 2+1 - Can recover 1 lost packet per 2</option>
+                            <option value="BASIC_3">Basic 3+1 - Can recover 1 lost packet per 3 (default)</option>
+                            <option value="BASIC_4">Basic 4+1 - Can recover 1 lost packet per 4</option>
+                            <option value="ENHANCED_2">Enhanced 2+2 - Can recover 2 lost packets per 2</option>
+                            <option value="ENHANCED_3">Enhanced 3+2 - Can recover 2 lost packets per 3</option>
+                            <option value="OVERLAPPING_3">Overlapping 3+1 - Extra redundancy with overlapping groups</option>
+                        </select>
+                        <small class="fec-description">
+                            {#if selectedFecScheme === 'NONE'}
+                                No error correction - fastest but no protection against packet loss
+                            {:else if selectedFecScheme === 'BASIC_2'}
+                                Groups of 2 data packets + 1 parity packet. Can recover if 1 packet is lost.
+                            {:else if selectedFecScheme === 'BASIC_3'}
+                                Groups of 3 data packets + 1 parity packet. Can recover if 1 packet is lost.
+                            {:else if selectedFecScheme === 'BASIC_4'}
+                                Groups of 4 data packets + 1 parity packet. Can recover if 1 packet is lost.
+                            {:else if selectedFecScheme === 'ENHANCED_2'}
+                                Groups of 2 data packets + 2 parity packets. Can recover if up to 2 packets are lost.
+                            {:else if selectedFecScheme === 'ENHANCED_3'}
+                                Groups of 3 data packets + 2 parity packets. Can recover if up to 2 packets are lost.
+                            {:else if selectedFecScheme === 'OVERLAPPING_3'}
+                                Overlapping groups provide extra redundancy for better recovery in noisy environments.
+                            {/if}
+                        </small>
+                    </div>
+                    
+                    <!-- Transmission Progress -->
+                    {#if transmissionProgress.phase !== 'idle'}
+                        <div class="progress-section">
+                            <h4>📤 Transmission Progress</h4>
+                            <div class="progress-info">
+                                <div class="progress-header">
+                                    <span>Session: {transmissionProgress.sessionId}</span>
+                                    <span>Phase: {transmissionProgress.phase.toUpperCase()}</span>
+                                </div>
+                                <div class="progress-subheader">
+                                    <span>FEC Scheme: {ggwaveService ? (ggwaveService.constructor as any).FEC_SCHEMES[selectedFecScheme]?.name || selectedFecScheme : selectedFecScheme}</span>
+                                    <span>Group Size: {ggwaveService ? (ggwaveService.constructor as any).FEC_SCHEMES[selectedFecScheme]?.groupSize || 'N/A' : 'N/A'}</span>
+                                </div>
+                                
+                                <div class="progress-bar-container">
+                                    <div class="progress-bar-bg">
+                                        <div 
+                                            class="progress-bar-fill" 
+                                            style="width: {transmissionProgress.totalChunks > 0 ? (transmissionProgress.currentChunk / transmissionProgress.totalChunks) * 100 : 0}%"
+                                        ></div>
+                                    </div>
+                                    <span class="progress-text">{transmissionProgress.currentChunk}/{transmissionProgress.totalChunks}</span>
+                                </div>
+                                
+                                <div class="chunk-grid">
+                                    {#each Array(transmissionProgress.totalChunks) as _, i}
+                                        <div class="chunk-indicator {i < transmissionProgress.currentChunk ? 'sent' : 'pending'}">
+                                            {i + 1}
+                                        </div>
+                                    {/each}
+                                </div>
+                                
+                                <div class="last-packet">
+                                    <small>Last packet: {transmissionProgress.lastPacket}</small>
+                                </div>
+                            </div>
+                        </div>
+                    {/if}
                 </div>
             {:else}
                 <div class="panel receive-panel">
@@ -221,6 +395,66 @@
                             </div>
                             <div class="message-container">
                                 <div class="message">{receivedText}</div>
+                            </div>
+                        </div>
+                    {/if}
+                    
+                    <!-- Reception Progress -->
+                    {#if receptionProgress.phase !== 'idle'}
+                        <div class="progress-section">
+                            <h4>📥 Reception Progress</h4>
+                            <div class="progress-info">
+                                <div class="progress-header">
+                                    <span>Session: {receptionProgress.sessionId}</span>
+                                    <span>Phase: {receptionProgress.phase.toUpperCase()}</span>
+                                </div>
+                                <div class="progress-subheader">
+                                    <span>Detecting FEC scheme from transmission...</span>
+                                </div>
+                                
+                                <div class="progress-bar-container">
+                                    <div class="progress-bar-bg">
+                                        <div 
+                                            class="progress-bar-fill receive" 
+                                            style="width: {receptionProgress.totalChunks > 0 ? (receptionProgress.receivedChunks / receptionProgress.totalChunks) * 100 : 0}%"
+                                        ></div>
+                                    </div>
+                                    <span class="progress-text">{receptionProgress.receivedChunks}/{receptionProgress.totalChunks}</span>
+                                </div>
+                                
+                                <div class="chunk-grid">
+                                    {#each Array(receptionProgress.totalChunks) as _, i}
+                                        <div class="chunk-indicator {receptionProgress.chunks[i + 1] ? 'received' : 'missing'}">
+                                            {i + 1}
+                                        </div>
+                                    {/each}
+                                </div>
+                                
+                                {#if Object.keys(receptionProgress.parity).length > 0}
+                                    <div class="parity-info">
+                                        <h5>🔧 Parity Data</h5>
+                                        <div class="parity-grid">
+                                            {#each Object.entries(receptionProgress.parity) as [range, received]}
+                                                <div class="parity-indicator {received ? 'received' : 'missing'}">
+                                                    P{range}
+                                                </div>
+                                            {/each}
+                                        </div>
+                                    </div>
+                                {/if}
+                                
+                                <div class="last-packet">
+                                    <small>Last packet: {receptionProgress.lastPacket}</small>
+                                </div>
+                                
+                                <div class="debug-info">
+                                    <h5>🔍 Debug Information</h5>
+                                    <div class="debug-grid">
+                                        <span>Total packets received: {debugInfo.totalReceived}</span>
+                                        <span>Active sessions: {debugInfo.sessions.length}</span>
+                                        <span>Latest session: {debugInfo.sessions[debugInfo.sessions.length - 1] || 'None'}</span>
+                                    </div>
+                                </div>
                             </div>
                         </div>
                     {/if}
@@ -243,7 +477,7 @@
                                 </div>
                             {/each}
                         </div>
-                    {:else}
+                    {:else if receptionProgress.phase === 'idle'}
                         <div class="no-messages">
                             <p>No messages received yet. Start listening to capture incoming transmissions.</p>
                         </div>
@@ -575,6 +809,233 @@
     .protocol-description {
         font-style: italic;
         color: #5a6c7d !important;
+    }
+    
+    .fec-description {
+        font-style: italic;
+        color: #5a6c7d !important;
+        line-height: 1.4;
+    }
+    
+    .checkbox-label {
+        display: flex;
+        align-items: center;
+        cursor: pointer;
+        font-weight: normal;
+        margin-bottom: 0;
+    }
+    
+    .checkbox-label input[type="checkbox"] {
+        width: auto;
+        margin-right: 8px;
+        cursor: pointer;
+    }
+    
+    .checkbox-text {
+        font-weight: 600;
+        color: #34495e;
+    }
+    
+    /* Progress Section Styles */
+    .progress-section {
+        margin-top: 20px;
+        padding: 20px;
+        background: #f8f9fa;
+        border-radius: 8px;
+        border: 1px solid #e9ecef;
+    }
+    
+    .progress-section h4 {
+        margin: 0 0 15px 0;
+        color: #495057;
+        font-size: 16px;
+    }
+    
+    .progress-info {
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+    }
+    
+    .progress-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        font-size: 12px;
+        color: #6c757d;
+        font-family: monospace;
+    }
+    
+    .progress-subheader {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        font-size: 11px;
+        color: #868e96;
+        font-family: monospace;
+        margin-top: 4px;
+        font-style: italic;
+    }
+    
+    .progress-bar-container {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+    }
+    
+    .progress-bar-bg {
+        flex: 1;
+        height: 8px;
+        background: #e9ecef;
+        border-radius: 4px;
+        overflow: hidden;
+    }
+    
+    .progress-bar-fill {
+        height: 100%;
+        background: linear-gradient(90deg, #007bff, #0056b3);
+        border-radius: 4px;
+        transition: width 0.3s ease;
+    }
+    
+    .progress-bar-fill.receive {
+        background: linear-gradient(90deg, #28a745, #1e7e34);
+    }
+    
+    .progress-text {
+        font-size: 12px;
+        font-weight: 600;
+        color: #495057;
+        min-width: 50px;
+        text-align: center;
+    }
+    
+    .chunk-grid {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 4px;
+        max-height: 120px;
+        overflow-y: auto;
+        padding: 8px;
+        background: white;
+        border-radius: 4px;
+        border: 1px solid #dee2e6;
+    }
+    
+    .chunk-indicator {
+        min-width: 30px;
+        height: 24px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        border-radius: 4px;
+        font-size: 10px;
+        font-weight: 600;
+        border: 1px solid #dee2e6;
+        background: #f8f9fa;
+        color: #6c757d;
+    }
+    
+    .chunk-indicator.sent {
+        background: #007bff;
+        color: white;
+        border-color: #0056b3;
+    }
+    
+    .chunk-indicator.received {
+        background: #28a745;
+        color: white;
+        border-color: #1e7e34;
+    }
+    
+    .chunk-indicator.pending {
+        background: #ffc107;
+        color: #000;
+        border-color: #ffc107;
+    }
+    
+    .chunk-indicator.missing {
+        background: #dc3545;
+        color: white;
+        border-color: #c82333;
+    }
+    
+    .parity-info {
+        margin-top: 8px;
+    }
+    
+    .parity-info h5 {
+        margin: 0 0 8px 0;
+        font-size: 14px;
+        color: #495057;
+    }
+    
+    .parity-grid {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 4px;
+    }
+    
+    .parity-indicator {
+        min-width: 50px;
+        height: 24px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        border-radius: 4px;
+        font-size: 10px;
+        font-weight: 600;
+        border: 1px solid #dee2e6;
+        background: #f8f9fa;
+        color: #6c757d;
+    }
+    
+    .parity-indicator.received {
+        background: #17a2b8;
+        color: white;
+        border-color: #138496;
+    }
+    
+    .last-packet {
+        padding: 8px;
+        background: white;
+        border-radius: 4px;
+        border: 1px solid #dee2e6;
+        font-family: monospace;
+        color: #6c757d;
+        word-break: break-all;
+        max-height: 60px;
+        overflow-y: auto;
+    }
+    
+    .debug-info {
+        margin-top: 8px;
+        padding: 8px;
+        background: #f8f9fa;
+        border-radius: 4px;
+        border: 1px solid #dee2e6;
+    }
+    
+    .debug-info h5 {
+        margin: 0 0 8px 0;
+        font-size: 12px;
+        color: #495057;
+    }
+    
+    .debug-grid {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 4px;
+        font-size: 11px;
+        color: #6c757d;
+        font-family: monospace;
+    }
+    
+    .debug-grid span {
+        padding: 2px 4px;
+        background: white;
+        border-radius: 2px;
+        border: 1px solid #e9ecef;
     }
 
 
@@ -988,6 +1449,28 @@
 
         h1 {
             font-size: 24px;
+        }
+        
+        .progress-section {
+            padding: 15px;
+            margin-top: 15px;
+        }
+        
+        .chunk-grid {
+            max-height: 80px;
+            gap: 2px;
+        }
+        
+        .chunk-indicator {
+            min-width: 25px;
+            height: 20px;
+            font-size: 9px;
+        }
+        
+        .parity-indicator {
+            min-width: 40px;
+            height: 20px;
+            font-size: 9px;
         }
 
     }
