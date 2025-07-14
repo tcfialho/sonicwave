@@ -30,8 +30,10 @@ Cada pacote é uma string com formatos específicos por tipo:
   - Ex.: `S:1234567890-123456::k8l5Kf9CrfydY0C7h+7MCw==:4:C` (comprimido) ou `S:1234567890-123456::k8l5Kf9CrfydY0C7h+7MCw==:4` (não comprimido).
 - **`D` (Data)**: `D:ID_SESSAO:ATUAL:DADOS`
   - Ex.: `D:1234567890-123456:1:H4sIAAAAAAAAA0vOzwMABf4B3Q==`
-- **`P` (Parity)**: `P:ID_SESSAO:inicio-fim:DADOS`
-  - Ex.: `P:1234567890-123456:1-4:H4sIAAAAAAAAA0vOzwMABf4B3Q==`
+- **`P` (Parity)**: `P:ID_SESSAO:inicio-fim-tipo:DADOS`
+  - Ex.: `P:1234567890-123456:1-3-0:H4sIAAAAAAAAA0vOzwMABf4B3Q==` (paridade primária)
+  - Ex.: `P:1234567890-123456:1-3-1:K5jIAAAAAAAAB1vPzwNABf4C4R==` (paridade secundária)
+  - Ex.: `P:1234567890-123456:2-4-O0:M6kIAAAAAAAAC2vQzwOABf4D5S==` (overlapping)
 - **`E` (End)**: `E:ID_SESSAO::`
   - Ex.: `E:1234567890-123456::`
 
@@ -39,12 +41,17 @@ Cada pacote é uma string com formatos específicos por tipo:
 - **`ID_SESSAO`**: `timestamp-nonce_6_digitos` (ex.: `1234567890-123456`, ≤ 15 caracteres).
 - **`SEQUENCIA`**:
   - `D`: Número do pacote (≤ 7 dígitos, máx. 9.999.999).
-  - `P`: `inicio-fim` (ex.: `1-4` para `D1-D4`).
+  - `P`: `inicio-fim-tipo` onde:
+    - `inicio-fim`: Range de pacotes (ex.: `1-3` para `D1-D3`)
+    - `tipo`: `0` (primária), `1` (secundária), `O0` (overlapping primária)
   - `S`/`E`: Vazio (`""`).
 - **`DADOS`**: Chunk ou paridade, codificado em Base64 tradicional, ≤ 100 caracteres (incluindo padding).
 - **`HASH_MD5`**: Hash MD5 (16 bytes, 24 caracteres em Base64 com padding).
 - **`TOTAL`**: Total de pacotes `DATA`.
-- **`FLAGS`**: `C` (comprimido com gzip), vazio (`""`) ou múltiplos flags separados por `,` (ex.: `C,E`).
+- **`FLAGS`**: Múltiplos flags separados por `,`:
+  - `C`: Comprimido com gzip
+  - `F[SCHEME]`: Esquema FEC (ex.: `FBASIC_3`, `FENHANCED_2`, `FOVERLAPPING_3`)
+  - Exemplo: `C,FBASIC_3` (comprimido com FEC básico 3+1)
 
 **Restrições**:
 - Cabeçalho `D`/`P`/`E` ≤ 40 caracteres; `S` até ~52 caracteres (recalcular `chunkSize = 140 − len(cabeçalho)`).
@@ -91,16 +98,27 @@ Cada pacote é uma string com formatos específicos por tipo:
 
 ### 5.1. Intervalo Automático
 - `sendLargeData` usa `await playSound(waveform)`, pausando até o som terminar.
+- **Delay adicional baseado no protocolo**:
+  - NORMAL: +1000ms entre pacotes
+  - FAST: +500ms entre pacotes
+  - FASTEST: sem delay adicional
 
 ### 5.2. Reatividade
 - Pacotes autônomos permitem processamento independente de temporização.
+- **Buffer de áudio aumentado**: 4096 samples para maior estabilidade
+- **Configurações explícitas**: Sample rate e canais definidos para compatibilidade
 
 ## 6. Funcionalidades de Robustez
 
 ### 6.1. Gerenciamento de Sessões
-- **Timeout adaptativo**: `TOTAL × duração_média_pacote × 1.5`, com `duração_média_pacote` de `ggwave.mode.txDurationPerChar()` ou medição real.
-- **Limpeza**: Sessões incompletas removidas após timeout.
-- **Duplicados**: Ignorados com `ID_SESSAO` + `SEQUENCIA`.
+- **Timeout adaptativo**: Baseado no protocolo e número de pacotes:
+  - Base: 30 segundos + (5 segundos × total_pacotes)
+  - Multiplicador por protocolo: NORMAL (3x), FAST (2x), FASTEST (1x)
+  - Mínimo: 60 segundos
+  - Exemplo: 10 pacotes NORMAL = 30s + (10×5s×3) = 180s
+- **Limpeza**: Sessões incompletas removidas após timeout com logging detalhado
+- **Duplicados**: Ignorados com `ID_SESSAO` + `SEQUENCIA` + tipo de pacote
+- **Debug**: Logs mostram pacotes recebidos, perdidos e recuperados
 
 ### 6.2. Validação de Integridade
 - **Hash MD5**: Em Base64 (24 caracteres), no `START`.
@@ -108,16 +126,26 @@ Cada pacote é uma string com formatos específicos por tipo:
 - **Corrupção**: Descarta mensagens inválidas.
 
 ### 6.3. Correção de Erros (FEC)
-- **Conceito (XOR)**:
-  1. Agrupa 4 pacotes `DATA` consecutivamente (ex.: D1-D4, D5-D8).
-  2. Calcula paridade via XOR nos dados brutos (com padding `\0` até 75 bytes), codifica em Base64.
-  3. Receptor decodifica Base64, aplica XOR, reconstrói 1 pacote perdido por grupo.
-- **Mapeamento**: `P:ID:inicio-fim:DADOS` (ex.: `1-4`).
-- **Grupos incompletos**: Sem paridade para <4 pacotes, vulneráveis a perdas.
-- **Padding**: Preenche chunks menores com `\0` até 75 bytes antes de Base64.
-- **Remoção**: Após Base64-decode e FEC, remove `\0` antes de concatenar chunks.
-- **Nota**: Paridade usa mesmo tamanho de chunk (75 bytes, ~100 caracteres em Base64).
-- **Limite**: 1 perda por grupo; usar DTMF para alto BER.
+
+#### 6.3.1. Esquemas FEC Disponíveis
+- **NONE**: Sem correção de erros (máxima velocidade)
+- **BASIC_2**: 2 pacotes dados + 1 paridade (recupera 1 perda)
+- **BASIC_3**: 3 pacotes dados + 1 paridade (padrão, recupera 1 perda)
+- **BASIC_4**: 4 pacotes dados + 1 paridade (recupera 1 perda)
+- **ENHANCED_2**: 2 pacotes dados + 2 paridades (recupera até 2 perdas)
+- **ENHANCED_3**: 3 pacotes dados + 2 paridades (recupera até 2 perdas)
+- **OVERLAPPING_3**: 3 pacotes dados + paridade + grupos sobrepostos (máxima robustez)
+
+#### 6.3.2. Algoritmos de Paridade
+- **Paridade Primária (tipo=0)**: XOR simples de todos os chunks do grupo
+- **Paridade Secundária (tipo=1)**: XOR ponderado (Reed-Solomon simplificado)
+- **Grupos Overlapping**: Paridade adicional para grupos sobrepostos
+
+#### 6.3.3. Recuperação
+- **1 Erro**: Usa paridade primária via XOR
+- **2 Erros**: Resolve sistema de equações com paridades primária e secundária
+- **Recuperação Agressiva**: Tenta todas as combinações de paridade disponíveis
+- **Padding**: Preenche chunks menores com `\0` até 75 bytes, remove após recuperação
 
 ### 6.4. Fragmentação
 - **Tamanho**: Chunks de até 75 bytes (~100 caracteres em Base64, incluindo padding).
@@ -157,22 +185,67 @@ E:1734567890-654321::
 
 **Nota:** Grupo D1-D4 com pacote de paridade P1-4. Se D2 for perdido, pode ser recuperado via: `D2 = D1 XOR D3 XOR D4 XOR P1-4`.
 
-### Exemplo 3: Com Compressão
+### Exemplo 3: Com Compressão e FEC Avançado
 
-**Mensagem:** Dados comprimidos com gzip (1 chunk)
+**Mensagem:** Dados comprimidos com gzip + FEC Enhanced 3+2 (5 chunks)
 
 ```
-S:1734567890-789012::m9F2k7P8vQ3nR6eE8tA5Cw==:1:C
-D:1734567890-789012:1:H4sIAAAAAAAAA+3OMQ7CMAyF4StyBME5IVJGRKsOVi1GZuPEpBK3+q01QIIVJHnvn3MJf2N4Y2B7GI8yj1z
+S:1734567890-789012::m9F2k7P8vQ3nR6eE8tA5Cw==:5:C,FENHANCED_3
+D:1734567890-789012:1:SGVsbG8gV29ybGQhIFRoaXMgaXMgYSB0ZXN0IG1lc3NhZ2Uu
+D:1734567890-789012:2:TG9yZW0gaXBzdW0gZG9sb3Igc2l0IGFtZXQsIGNvbnNlY3RldHVyIGFkaXBpc2NpbmcgZWxpdCwgc2VkIGRvIGVpdXNtb2QgdGVt
+D:1734567890-789012:3:cG9yIGluY2lkaWR1bnQgdXQgbGFib3JlIGV0IGRvbG9yZSBtYWduYSBhbGlxdWEuIExvcmVtIGlwc3VtIGRvbG9yIHNpdCBhbWV0
+D:1734567890-789012:4:LCBjb25zZWN0ZXR1ciBhZGlwaXNjaW5nIGVsaXQsIHNlZCBkbyBlaXVzbW9kIHRlbXBvciBpbmNpZGlkdW50IHV0IGxhYm9yZSBl
+D:1734567890-789012:5:dCBkb2xvcmUgbWFnbmEgYWxpcXVhLiBMb3JlbSBpcHN1bSBkb2xvciBzaXQgYW1ldCwgY29uc2VjdGV0dXIgYWRpcGlzY2luZyBl
+P:1734567890-789012:1-3-0:ZAAHRQZSHR9DFBxHFloNHwMZBw4UCF0jCgZRBFNFUhwHD1QIFV4WWhQFAQJcRxtHV3cABkYDSUNaEBwZABxUDRsGBQUWGkJdGwAZ
+P:1734567890-789012:1-3-1:YBBISRTISFNEGByIGGpOIQNaBx5VDG1kDhaSCGOGViwIE2RJGWRXYiRGBRKdSytIW4dBClZETVO7ExyaCCyVESJJBRVXHlOFgAY
+P:1734567890-789012:4-5-0:WAAQDxTDGAdADwNFEwYGBg5TCG0jCgZRBFNFUhwHD1QIFV4WWhQFAQJcRxtHV3cABkYDSUNaEBwZABxUDRsGBQUWGkJdGwAZ
 E:1734567890-789012::
 ```
 
-**Nota:** FLAGS=C indica compressão gzip. Hash MD5 calculado nos dados comprimidos.
+**Nota:** FLAGS=C,FENHANCED_3 indica compressão gzip + FEC Enhanced 3+2. Grupos 1-3 e 4-5 com paridades primária (tipo=0) e secundária (tipo=1). Hash MD5 calculado nos dados comprimidos.
+
+### Exemplo 4: FEC Overlapping para Máxima Robustez
+
+**Mensagem:** Dados com FEC Overlapping 3+1 (6 chunks)
+
+```
+S:1734567890-456789::n2B3k8Q9wR5oS7fF9tB6Dw==:6:FOVERLAPPING_3
+D:1734567890-456789:1:SGVsbG8gV29ybGQhIFRoaXMgaXMgYSB0ZXN0IG1lc3NhZ2Uu
+D:1734567890-456789:2:TG9yZW0gaXBzdW0gZG9sb3Igc2l0IGFtZXQsIGNvbnNlY3RldHVyIGFkaXBpc2NpbmcgZWxpdCwgc2VkIGRvIGVpdXNtb2QgdGVt
+D:1734567890-456789:3:cG9yIGluY2lkaWR1bnQgdXQgbGFib3JlIGV0IGRvbG9yZSBtYWduYSBhbGlxdWEuIExvcmVtIGlwc3VtIGRvbG9yIHNpdCBhbWV0
+D:1734567890-456789:4:LCBjb25zZWN0ZXR1ciBhZGlwaXNjaW5nIGVsaXQsIHNlZCBkbyBlaXVzbW9kIHRlbXBvciBpbmNpZGlkdW50IHV0IGxhYm9yZSBl
+D:1734567890-456789:5:dCBkb2xvcmUgbWFnbmEgYWxpcXVhLiBMb3JlbSBpcHN1bSBkb2xvciBzaXQgYW1ldCwgY29uc2VjdGV0dXIgYWRpcGlzY2luZyBl
+D:1734567890-456789:6:bGl0LCBzZWQgZG8gZWl1c21vZCB0ZW1wb3IgaW5jaWRpZHVudCB1dCBsYWJvcmUgZXQgZG9sb3JlIG1hZ25hIGFsaXF1YS4=
+P:1734567890-456789:1-3-0:ZAAHRQZSHR9DFBxHFloNHwMZBw4UCF0jCgZRBFNFUhwHD1QIFV4WWhQFAQJcRxtHV3cABkYDSUNaEBwZABxUDRsGBQUWGkJdGwAZ
+P:1734567890-456789:2-4-O0:YBBISRTISFNEGByIGGpOIQNaBx5VDG1kDhaSCGOGViwIE2RJGWRXYiRGBRKdSytIW4dBClZETVO7ExyaCCyVESJJBRVXHlOFgAY
+P:1734567890-456789:4-6-0:WAAQDxTDGAdADwNFEwYGBg5TCG0jCgZRBFNFUhwHD1QIFV4WWhQFAQJcRxtHV3cABkYDSUNaEBwZABxUDRsGBQUWGkJdGwAZ
+P:1734567890-456789:3-5-O1:XCCJTUSJTGOEGDYJHHRPJRMCCX6WEDH2lEiaTDHPHWixJF3SKGXYijSGCRLE2yuJX5eCDmZFUVO8FyzaDDyWFTKKCRWYIlPGhBZ
+E:1734567890-456789::
+```
+
+**Nota:** FLAGS=FOVERLAPPING_3 cria grupos sobrepostos: [1-3], [2-4], [4-6], [3-5] com paridades principais (tipo=0) e overlapping (tipo=O0, O1). Permite recuperação robusta mesmo com múltiplas perdas adjacentes.
 
 ## 8. Notas de Implementação
+
+### 8.1. Processamento de Dados
 1. **MD5 Byte-Stream**: MD5 calculado nos dados transmitidos: após compressão (se `FLAGS=C`) ou brutos. Verificar antes da descompressão.
 2. **MD5 em Base64**: Usar Base64 tradicional (16 bytes → 24 caracteres com padding `=`).
 3. **Regra do `:` Final**: Se `FLAGS` vazio, omitir o campo e terminar o cabeçalho sem o último `:`. Ex.: `S:ID::HASH:TOTAL`. Evitar `S:ID::HASH:TOTAL::`.
 4. **Tamanho do Chunk com Múltiplos Flags**: Recalcular tamanho do chunk como `140 − len(cabeçalho)` para `S` (até ~52 caracteres) e `D`/`P`/`E` (≤ 40).
 5. **Compatibilidade Base64**: Base64 tradicional usa `A-Z`, `a-z`, `0-9`, `+`, `/`, `=`. Compatível com ASCII 32-126; evitar modos `ggwave` que filtrem `+` ou `/`.
-6. **Extensão do Limite de Sequência**: Para suportar >9.999.999 pacotes, ampliar o campo `SEQUENCIA` e recalcular limites de cabeçalho e chunk.
+
+### 8.2. Timeouts e Robustez
+6. **Timeout Adaptativo**: Calculado como `30s + (5s × total_pacotes × multiplicador_protocolo)` onde multiplicador é 3x para NORMAL, 2x para FAST, 1x para FASTEST. Mínimo de 60s.
+7. **Delays de Transmissão**: Adicionar delay entre pacotes baseado no protocolo: 1000ms para NORMAL, 500ms para FAST, 0ms para FASTEST.
+8. **Captura de Áudio**: Buffer de 4096 samples, taxa de 48kHz, mono explícito, sem processamento de áudio (echoCancellation/autoGainControl/noiseSuppression = false).
+
+### 8.3. Correção de Erros (FEC)
+9. **Esquemas FEC**: 7 opções desde NONE até OVERLAPPING_3, indicados no FLAGS como `F[SCHEME]` (ex.: `FBASIC_3`).
+10. **Algoritmos de Paridade**: Tipo 0 (XOR simples), Tipo 1 (XOR ponderado), Overlapping (grupos sobrepostos).
+11. **Recuperação**: Tentativa automática com 1 erro (XOR), 2 erros (sistema linear), e recuperação agressiva usando todas as paridades disponíveis.
+12. **Padding FEC**: Chunks menores preenchidos com `\0` até 75 bytes antes do cálculo da paridade, removidos após recuperação.
+
+### 8.4. Limites e Extensões
+13. **Extensão do Limite de Sequência**: Para suportar >9.999.999 pacotes, ampliar o campo `SEQUENCIA` e recalcular limites de cabeçalho e chunk.
+14. **Detecção de Duplicatas**: Usando `ID_SESSAO + SEQUENCIA + tipo_pacote` para ignorar retransmissões.
+15. **Limpeza de Sessões**: Remoção automática após timeout com logging detalhado do estado final da sessão.
