@@ -8,7 +8,7 @@
     let isInitialized = false;
     let isListening = false;
     let volume = 60;
-    let selectedProtocol = 'GGWAVE_PROTOCOL_AUDIBLE_NORMAL';
+    let selectedProtocol = 'GGWAVE_PROTOCOL_ULTRASONIC_NORMAL';
     let status = 'Ready';
     let receivedMessages: Array<{text: string, timestamp: Date}> = [];
     let availableProtocols: Array<{id: string, name: string, description: string}> = [];
@@ -30,9 +30,19 @@
             hasDualTone = availableProtocols.some(p => p.id.includes('DT') || p.name.includes('⚡'));
             hasMonoTone = availableProtocols.some(p => p.id.includes('MT') || p.name.includes('📡'));
             
-            // Set the first available protocol as default
-            if (availableProtocols.length > 0) {
+            // Set ultrasonic normal as default if available, otherwise use first available
+            const ultrasonicNormal = availableProtocols.find(p => 
+                p.id === 'GGWAVE_PROTOCOL_ULTRASONIC_NORMAL' || 
+                p.id === 'GGWAVE_PROTOCOL_ULTRASOUND_NORMAL'
+            );
+            
+            if (ultrasonicNormal) {
+                selectedProtocol = ultrasonicNormal.id;
+            } else if (availableProtocols.length > 0) {
                 selectedProtocol = availableProtocols[0].id;
+            }
+            
+            if (availableProtocols.length > 0) {
                 status = `GGWave initialized - Ready to transmit/receive (${availableProtocols.length} protocols available)`;
             } else {
                 status = 'GGWave initialized but no protocols found - check console';
