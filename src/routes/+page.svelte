@@ -16,6 +16,7 @@
     let hasUltrasonic = false;
     let hasDualTone = false;
     let hasMonoTone = false;
+    let isTransmitting = false;
 
     onMount(async () => {
         ggwaveService = new GGWaveService();
@@ -53,20 +54,25 @@
     });
 
     async function sendText() {
-        if (!isInitialized || !textToSend.trim()) return;
+        if (!isInitialized || !textToSend.trim() || isTransmitting) return;
+        
+        const messageToSend = textToSend;
+        isTransmitting = true;
         
         try {
-            status = 'Encoding text to sound...';
+            status = '🔄 Encoding text to sound...';
             const soundData = await ggwaveService.textToSound(textToSend, volume, selectedProtocol);
             
-            status = 'Playing sound transmission...';
+            status = '📡 Transmitting sound waves...';
             await ggwaveService.playSound(soundData);
             
             const protocolName = availableProtocols.find(p => p.id === selectedProtocol)?.name || selectedProtocol;
-            status = `Transmitted: "${textToSend}" using ${protocolName}`;
+            status = `✅ Transmitted: "${messageToSend}" using ${protocolName}`;
             textToSend = ''; // Clear text automatically after transmission
         } catch (error) {
-            status = `Transmission failed: ${error}`;
+            status = `❌ Transmission failed: ${error}`;
+        } finally {
+            isTransmitting = false;
         }
     }
 
@@ -113,8 +119,13 @@
     <h1>🔊 SonicWave</h1>
     <p>Transmit and receive text using sound waves with maximum noise tolerance</p>
     
-    <div class="status-bar">
+    <div class="status-bar {isTransmitting ? 'transmitting' : ''}">
         <strong>Status:</strong> {status}
+        {#if isTransmitting}
+            <div class="progress-bar">
+                <div class="progress-fill"></div>
+            </div>
+        {/if}
     </div>
 
     <div class="container">
@@ -161,14 +172,18 @@
             <div class="button-group">
                 <button 
                     on:click={sendText} 
-                    disabled={!isInitialized || !textToSend.trim()}
-                    class="btn btn-primary">
-                    🎵 Transmit Text
+                    disabled={!isInitialized || !textToSend.trim() || isTransmitting}
+                    class="btn btn-primary {isTransmitting ? 'transmitting' : ''}">
+                    {#if isTransmitting}
+                        <span class="spinner"></span> Transmitting...
+                    {:else}
+                        🎵 Transmit Text
+                    {/if}
                 </button>
                 
                 <button 
                     on:click={clearTextInput} 
-                    disabled={!textToSend.trim()}
+                    disabled={!textToSend.trim() || isTransmitting}
                     class="btn btn-secondary">
                     🗑️ Clear
                 </button>
@@ -301,6 +316,36 @@
         margin: 20px 0;
         text-align: center;
         font-family: monospace;
+        position: relative;
+        transition: all 0.3s ease;
+    }
+
+    .status-bar.transmitting {
+        background: #e8f5e8;
+        border-color: #27ae60;
+        box-shadow: 0 0 10px rgba(39, 174, 96, 0.3);
+    }
+
+    .progress-bar {
+        width: 100%;
+        height: 4px;
+        background: rgba(39, 174, 96, 0.2);
+        border-radius: 2px;
+        margin-top: 8px;
+        overflow: hidden;
+    }
+
+    .progress-fill {
+        height: 100%;
+        background: linear-gradient(90deg, #27ae60, #2ecc71);
+        border-radius: 2px;
+        animation: progress 2s ease-in-out infinite;
+    }
+
+    @keyframes progress {
+        0% { width: 0%; transform: translateX(-100%); }
+        50% { width: 100%; transform: translateX(0%); }
+        100% { width: 100%; transform: translateX(100%); }
     }
 
     .container {
@@ -407,6 +452,27 @@
     .btn-secondary:hover:not(:disabled) {
         background: #229954;
         transform: translateY(-2px);
+    }
+
+    .btn.transmitting {
+        background: #27ae60;
+        cursor: not-allowed;
+        position: relative;
+    }
+
+    .spinner {
+        display: inline-block;
+        width: 12px;
+        height: 12px;
+        border: 2px solid rgba(255, 255, 255, 0.3);
+        border-radius: 50%;
+        border-top-color: #fff;
+        animation: spin 1s ease-in-out infinite;
+        margin-right: 8px;
+    }
+
+    @keyframes spin {
+        to { transform: rotate(360deg); }
     }
 
     .btn-small {
