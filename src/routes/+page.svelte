@@ -7,7 +7,6 @@
     let receivedText = '';
     let isInitialized = false;
     let isListening = false;
-    let volume = 80;
     let selectedProtocol = 'GGWAVE_PROTOCOL_ULTRASONIC_FASTEST';
     let status = 'Ready';
     let receivedMessages: Array<{text: string, timestamp: Date}> = [];
@@ -65,29 +64,18 @@
     async function sendText() {
         if (!isInitialized || !textToSend.trim() || isTransmitting) return;
         
-        const messageToSend = textToSend;
         isTransmitting = true;
-        let compressionInfo = '';
         
         try {
-            status = '🔄 Analyzing and encoding text...';
+            status = '🔄 Encoding text...';
             
-            // Capturar informações de compressão antes da transmissão
-            const compressionResult = ggwaveService.testCompression(textToSend);
-            
-            const soundData = await ggwaveService.textToSound(textToSend, volume, selectedProtocol);
-            
-            // Criar indicação visual de compressão (só quando realmente comprimir)
-            if (compressionResult.method === 'lz-string') {
-                compressionInfo = ` 🗜️ Compressed (${compressionResult.savings} saved)`;
-            }
+            const soundData = await ggwaveService.textToSound(textToSend, selectedProtocol);
             
             status = '📡 Transmitting sound waves...';
             await ggwaveService.playSound(soundData);
             
             const protocolName = availableProtocols.find(p => p.id === selectedProtocol)?.name || selectedProtocol;
-            status = `✅ Transmitted${compressionInfo} using ${protocolName}`;
-            // textToSend = ''; // Clear text automatically after transmission
+            status = `✅ Transmitted using ${protocolName}`;
         } catch (error) {
             status = `❌ Transmission failed: ${error}`;
         } finally {
@@ -102,7 +90,7 @@
             isListening = true;
             status = 'Listening for transmissions...';
             
-            await ggwaveService.startListening((text: string, wasDecompressed?: boolean) => {
+            await ggwaveService.startListening((text: string) => {
                 const message = {
                     text: text,
                     timestamp: new Date()
@@ -110,12 +98,7 @@
                 receivedMessages = [message, ...receivedMessages];
                 receivedText = text;
                 
-                // Indicação visual de descompressão
-                if (wasDecompressed) {
-                    status = `📥 Received: "${text}" 🗜️ Auto-decompressed`;
-                } else {
-                    status = `📥 Received: "${text}"`;
-                }
+                status = `📥 Received: "${text}"`;
             });
         } catch (error) {
             status = `Failed to start listening: ${error}`;
@@ -206,22 +189,11 @@
                             bind:value={textToSend} 
                             placeholder="Enter text to transmit via sound..."
                             rows="4"
-                            maxlength="100">
+                            maxlength="140">
                         </textarea>
-                        <small>Maximum 100 characters for reliable transmission</small>
+                        <small>Maximum 140 characters (ggwave transmission limit) - {textToSend.length}/140</small>
                     </div>
                     
-                    <div class="form-group">
-                        <label for="volume">Volume: {volume}%</label>
-                        <input 
-                            id="volume"
-                            type="range" 
-                            bind:value={volume} 
-                            min="30" 
-                            max="100" 
-                            step="5">
-                        <small>Recommended range: 40-80% (ggwave auto-scales internally)</small>
-                    </div>
                     
                     <div class="form-group">
                         <label for="protocol">Transmission Mode:</label>
@@ -572,7 +544,7 @@
         color: #34495e;
     }
 
-    textarea, input[type="range"], .protocol-select {
+    textarea, .protocol-select {
         width: 100%;
         max-width: 100%;
         box-sizing: border-box;
@@ -605,11 +577,6 @@
         color: #5a6c7d !important;
     }
 
-    input[type="range"] {
-        padding: 0;
-        height: 8px;
-        background: #ecf0f1;
-    }
 
     small {
         display: block;
