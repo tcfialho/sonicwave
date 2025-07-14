@@ -18,6 +18,7 @@
     let hasMonoTone = false;
     let isTransmitting = false;
     let activeTab: 'send' | 'receive' = 'send';
+    let showHelpModal = false;
 
     onMount(async () => {
         ggwaveService = new GGWaveService();
@@ -109,6 +110,20 @@
         status = 'Text input cleared';
     }
 
+    async function stopListening() {
+        // Note: In a real implementation, you'd need to stop the media stream
+        // For now, we'll just reset the listening state
+        isListening = false;
+        status = 'Stopped listening';
+    }
+
+    async function handleReceiveTabClick() {
+        activeTab = 'receive';
+        if (!isListening && isInitialized) {
+            await startListening();
+        }
+    }
+
 
 </script>
 
@@ -118,7 +133,6 @@
 
 <main>
     <h1>🔊 SonicWave</h1>
-    <p>Transmit and receive text using sound waves with maximum noise tolerance</p>
     
     <!-- Fixed Status Bar -->
     <div class="status-bar-fixed">
@@ -137,7 +151,7 @@
             </button>
             <button 
                 class="tab-button {activeTab === 'receive' ? 'active' : ''}" 
-                on:click={() => activeTab = 'receive'}>
+                on:click={handleReceiveTabClick}>
                 📥 Receive Text
             </button>
         </div>
@@ -215,74 +229,85 @@
         </div>
     </div>
 
-    <div class="info-panel">
-        <h3>ℹ️ GGWave Protocol Guide</h3>
-        <p>GGWave offers 12 different transmission protocols (0-11) for various use cases:</p>
-        
-        <div class="protocol-info">
-            {#if hasAudible}
-            <h4>🔊 Standard Audible Protocols (0-2)</h4>
-            <ul>
-                <li><strong>Normal (0):</strong> 8 bytes/sec, F0=1875Hz, most robust (recommended)</li>
-                <li><strong>Fast (1):</strong> 12 bytes/sec, balanced speed/robustness</li>
-                <li><strong>Fastest (2):</strong> 16 bytes/sec, fastest but least robust</li>
-            </ul>
-            {/if}
-            
-            {#if hasUltrasonic}
-            <h4>🔇 Ultrasonic Protocols [U] (3-5)</h4>
-            <ul>
-                <li><strong>Ultrasonic Normal (3):</strong> F0=15000Hz, inaudible to humans</li>
-                <li><strong>Ultrasonic Fast/Fastest (4-5):</strong> Silent, varying speeds</li>
-            </ul>
-            <p><em>Note: Requires devices/speakers capable of ultrasonic frequencies (15kHz+)</em></p>
-            {/if}
-            
-            {#if hasDualTone}
-            <h4>⚡ Dual-Tone [DT] Protocols (6-8)</h4>
-            <ul>
-                <li><strong>Purpose:</strong> Optimized for microcontrollers and IoT devices</li>
-                <li><strong>Characteristic:</strong> Uses dual-tone modulation technique</li>
-                <li><strong>Use case:</strong> Arduino, ESP32, embedded systems</li>
-            </ul>
-            {/if}
-            
-            {#if hasMonoTone}
-            <h4>📡 Mono-Tone [MT] Protocols (9-11)</h4>
-            <ul>
-                <li><strong>Purpose:</strong> Alternative for microcontrollers with limited processing</li>
-                <li><strong>Characteristic:</strong> Uses single-tone modulation</li>
-                <li><strong>Use case:</strong> Simple embedded systems, lower-power devices</li>
-            </ul>
-            {/if}
+    <!-- Help Modal -->
+    {#if showHelpModal}
+        <div class="modal-overlay" on:click={() => showHelpModal = false}>
+            <div class="modal-content" on:click={(e) => e.stopPropagation()}>
+                <div class="modal-header">
+                    <h3>ℹ️ GGWave Protocol Guide</h3>
+                    <button class="modal-close" on:click={() => showHelpModal = false}>✕</button>
+                </div>
+                
+                <div class="modal-body">
+                    <p>GGWave offers 12 different transmission protocols (0-11) for various use cases:</p>
+                    
+                    <div class="protocol-info">
+                        {#if hasAudible}
+                        <h4>🔊 Standard Audible Protocols (0-2)</h4>
+                        <ul>
+                            <li><strong>Normal (0):</strong> 8 bytes/sec, F0=1875Hz, most robust (recommended)</li>
+                            <li><strong>Fast (1):</strong> 12 bytes/sec, balanced speed/robustness</li>
+                            <li><strong>Fastest (2):</strong> 16 bytes/sec, fastest but least robust</li>
+                        </ul>
+                        {/if}
+                        
+                        {#if hasUltrasonic}
+                        <h4>🔇 Ultrasonic Protocols [U] (3-5)</h4>
+                        <ul>
+                            <li><strong>Ultrasonic Normal (3):</strong> F0=15000Hz, inaudible to humans</li>
+                            <li><strong>Ultrasonic Fast/Fastest (4-5):</strong> Silent, varying speeds</li>
+                        </ul>
+                        <p><em>Note: Requires devices/speakers capable of ultrasonic frequencies (15kHz+)</em></p>
+                        {/if}
+                        
+                        {#if hasDualTone}
+                        <h4>⚡ Dual-Tone [DT] Protocols (6-8)</h4>
+                        <ul>
+                            <li><strong>Purpose:</strong> Optimized for microcontrollers and IoT devices</li>
+                            <li><strong>Characteristic:</strong> Uses dual-tone modulation technique</li>
+                            <li><strong>Use case:</strong> Arduino, ESP32, embedded systems</li>
+                        </ul>
+                        {/if}
+                        
+                        {#if hasMonoTone}
+                        <h4>📡 Mono-Tone [MT] Protocols (9-11)</h4>
+                        <ul>
+                            <li><strong>Purpose:</strong> Alternative for microcontrollers with limited processing</li>
+                            <li><strong>Characteristic:</strong> Uses single-tone modulation</li>
+                            <li><strong>Use case:</strong> Simple embedded systems, lower-power devices</li>
+                        </ul>
+                        {/if}
+                    </div>
+                    
+                    <p><strong>Technical Details:</strong></p>
+                    <ul>
+                        <li><strong>Modulation:</strong> Multi-frequency FSK (Frequency-Shift Keying)</li>
+                        <li><strong>Error Correction:</strong> Reed-Solomon coding</li>
+                        <li><strong>Data Encoding:</strong> 4-bit chunks, 3 bytes using 6 tones</li>
+                        <li><strong>Frequency Spacing:</strong> dF = 46.875 Hz</li>
+                    </ul>
+                    <p><strong>Tips for best results:</strong></p>
+                    <ul>
+                        <li>Keep messages short (under 50 characters recommended)</li>
+                        <li>Use high volumes (70-100%) for better audibility</li>
+                        <li>Minimize background noise when possible</li>
+                        <li>Keep devices relatively close (1-3 meters)</li>
+                        <li>Test audio first to ensure speakers are working</li>
+                        <li>Try with headphones if having issues</li>
+                    </ul>
+                    
+                    <p><strong>Troubleshooting:</strong></p>
+                    <ul>
+                        <li>If you don't hear anything, click "Test Audio" first</li>
+                        <li>Check browser audio permissions</li>
+                        <li>Try increasing volume to 100%</li>
+                        <li>Make sure your computer speakers/headphones are on</li>
+                        <li>Try a short test message like "hi" first</li>
+                    </ul>
+                </div>
+            </div>
         </div>
-        
-        <p><strong>Technical Details:</strong></p>
-        <ul>
-            <li><strong>Modulation:</strong> Multi-frequency FSK (Frequency-Shift Keying)</li>
-            <li><strong>Error Correction:</strong> Reed-Solomon coding</li>
-            <li><strong>Data Encoding:</strong> 4-bit chunks, 3 bytes using 6 tones</li>
-            <li><strong>Frequency Spacing:</strong> dF = 46.875 Hz</li>
-        </ul>
-        <p><strong>Tips for best results:</strong></p>
-        <ul>
-            <li>Keep messages short (under 50 characters recommended)</li>
-            <li>Use high volumes (70-100%) for better audibility</li>
-            <li>Minimize background noise when possible</li>
-            <li>Keep devices relatively close (1-3 meters)</li>
-            <li>Test audio first to ensure speakers are working</li>
-            <li>Try with headphones if having issues</li>
-        </ul>
-        
-        <p><strong>Troubleshooting:</strong></p>
-        <ul>
-            <li>If you don't hear anything, click "Test Audio" first</li>
-            <li>Check browser audio permissions</li>
-            <li>Try increasing volume to 100%</li>
-            <li>Make sure your computer speakers/headphones are on</li>
-            <li>Try a short test message like "hi" first</li>
-        </ul>
-    </div>
+    {/if}
 
     <!-- Fixed Controls at Bottom -->
     <div class="controls-section">
@@ -308,10 +333,10 @@
                     </button>
                 {:else}
                     <button 
-                        on:click={startListening} 
-                        disabled={!isInitialized || isListening}
+                        on:click={isListening ? stopListening : startListening} 
+                        disabled={!isInitialized}
                         class="btn btn-primary">
-                        {isListening ? '🎧 Listening...' : '🎧 Start Listening'}
+                        {isListening ? '🛑 Stop Listening' : '🎧 Start Listening'}
                     </button>
                     
                     <button 
@@ -321,6 +346,13 @@
                         🗑️ Clear History
                     </button>
                 {/if}
+                
+                <button 
+                    on:click={() => showHelpModal = true} 
+                    class="btn btn-help"
+                    title="Protocol Help & Guide">
+                    ❓ Help
+                </button>
             </div>
             
             <!-- Progress bar appears below buttons -->
@@ -698,17 +730,89 @@
         color: #6c757d;
     }
 
-    .info-panel {
-        background: #f8f9fa;
-        border: 1px solid #dee2e6;
-        border-radius: 8px;
-        padding: 20px;
-        margin-top: 30px;
-    }
 
-    .info-panel h3 {
-        margin-top: 0;
+    .btn-help {
+        background: #6c757d;
+        color: white;
+        border: none;
+    }
+    
+    .btn-help:hover:not(:disabled) {
+        background: #5a6268;
+        transform: translateY(-2px);
+    }
+    
+    /* Modal Styles */
+    .modal-overlay {
+        position: fixed;
+        top: 0;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        background: rgba(0, 0, 0, 0.5);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        z-index: 1002;
+        backdrop-filter: blur(4px);
+    }
+    
+    .modal-content {
+        background: white;
+        border-radius: 12px;
+        max-width: 600px;
+        max-height: 80vh;
+        width: 90%;
+        box-shadow: 0 20px 40px rgba(0, 0, 0, 0.3);
+        overflow: hidden;
+        animation: modalSlideIn 0.3s ease-out;
+    }
+    
+    @keyframes modalSlideIn {
+        from {
+            opacity: 0;
+            transform: scale(0.9) translateY(-20px);
+        }
+        to {
+            opacity: 1;
+            transform: scale(1) translateY(0);
+        }
+    }
+    
+    .modal-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        padding: 20px;
+        border-bottom: 1px solid #e9ecef;
+        background: #f8f9fa;
+    }
+    
+    .modal-header h3 {
+        margin: 0;
         color: #495057;
+    }
+    
+    .modal-close {
+        background: none;
+        border: none;
+        font-size: 18px;
+        color: #6c757d;
+        cursor: pointer;
+        padding: 4px 8px;
+        border-radius: 4px;
+        transition: all 0.3s;
+    }
+    
+    .modal-close:hover {
+        background: #e9ecef;
+        color: #495057;
+    }
+    
+    .modal-body {
+        padding: 20px;
+        overflow-y: auto;
+        max-height: calc(80vh - 80px);
     }
 
     .info-panel ul {
@@ -766,6 +870,17 @@
             font-size: 12px;
             padding: 10px 15px;
         }
+        
+        .modal-content {
+            width: 95%;
+            max-height: 85vh;
+        }
+        
+        .modal-body {
+            padding: 15px;
+            max-height: calc(85vh - 80px);
+        }
+        
 
         textarea, .protocol-select {
             font-size: 16px; /* Prevent zoom on iOS */
