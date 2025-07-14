@@ -8,7 +8,7 @@
     let isInitialized = false;
     let isListening = false;
     let volume = 80;
-    let selectedProtocol = 'GGWAVE_PROTOCOL_ULTRASONIC_NORMAL';
+    let selectedProtocol = 'GGWAVE_PROTOCOL_ULTRASONIC_FASTEST';
     let status = 'Ready';
     let receivedMessages: Array<{text: string, timestamp: Date}> = [];
     let availableProtocols: Array<{id: string, name: string, description: string}> = [];
@@ -33,13 +33,20 @@
             hasDualTone = availableProtocols.some(p => p.id.includes('DT') || p.name.includes('⚡'));
             hasMonoTone = availableProtocols.some(p => p.id.includes('MT') || p.name.includes('📡'));
             
-            // Set ultrasonic normal as default if available, otherwise use first available
+            // Set ultrasonic fastest as default if available, otherwise fallback
+            const ultrasonicFastest = availableProtocols.find(p => 
+                p.id === 'GGWAVE_PROTOCOL_ULTRASONIC_FASTEST' || 
+                p.id === 'GGWAVE_PROTOCOL_ULTRASOUND_FASTEST'
+            );
+            
             const ultrasonicNormal = availableProtocols.find(p => 
                 p.id === 'GGWAVE_PROTOCOL_ULTRASONIC_NORMAL' || 
                 p.id === 'GGWAVE_PROTOCOL_ULTRASOUND_NORMAL'
             );
             
-            if (ultrasonicNormal) {
+            if (ultrasonicFastest) {
+                selectedProtocol = ultrasonicFastest.id;
+            } else if (ultrasonicNormal) {
                 selectedProtocol = ultrasonicNormal.id;
             } else if (availableProtocols.length > 0) {
                 selectedProtocol = availableProtocols[0].id;
@@ -60,16 +67,26 @@
         
         const messageToSend = textToSend;
         isTransmitting = true;
+        let compressionInfo = '';
         
         try {
-            status = '🔄 Encoding text to sound...';
+            status = '🔄 Analyzing and encoding text...';
+            
+            // Capturar informações de compressão antes da transmissão
+            const compressionResult = ggwaveService.testCompression(textToSend);
+            
             const soundData = await ggwaveService.textToSound(textToSend, volume, selectedProtocol);
+            
+            // Criar indicação visual de compressão (só quando realmente comprimir)
+            if (compressionResult.method === 'lz-string') {
+                compressionInfo = ` 🗜️ Compressed (${compressionResult.savings} saved)`;
+            }
             
             status = '📡 Transmitting sound waves...';
             await ggwaveService.playSound(soundData);
             
             const protocolName = availableProtocols.find(p => p.id === selectedProtocol)?.name || selectedProtocol;
-            status = `✅ Transmitted: "${messageToSend}" using ${protocolName}`;
+            status = `✅ Transmitted${compressionInfo} using ${protocolName}`;
             // textToSend = ''; // Clear text automatically after transmission
         } catch (error) {
             status = `❌ Transmission failed: ${error}`;
@@ -85,14 +102,20 @@
             isListening = true;
             status = 'Listening for transmissions...';
             
-            await ggwaveService.startListening((text: string) => {
+            await ggwaveService.startListening((text: string, wasDecompressed?: boolean) => {
                 const message = {
                     text: text,
                     timestamp: new Date()
                 };
                 receivedMessages = [message, ...receivedMessages];
                 receivedText = text;
-                status = `Received: "${text}"`;
+                
+                // Indicação visual de descompressão
+                if (wasDecompressed) {
+                    status = `📥 Received: "${text}" 🗜️ Auto-decompressed`;
+                } else {
+                    status = `📥 Received: "${text}"`;
+                }
             });
         } catch (error) {
             status = `Failed to start listening: ${error}`;
@@ -110,6 +133,7 @@
         status = 'Text input cleared';
     }
 
+
     async function stopListening() {
         // Note: In a real implementation, you'd need to stop the media stream
         // For now, we'll just reset the listening state
@@ -121,6 +145,22 @@
         activeTab = 'receive';
         if (!isListening && isInitialized) {
             await startListening();
+        }
+    }
+
+    async function copyToClipboard(text: string) {
+        try {
+            await navigator.clipboard.writeText(text);
+            status = `📋 Copied to clipboard: "${text.substring(0, 30)}${text.length > 30 ? '...' : ''}"`;
+        } catch (err) {
+            // Fallback para browsers antigos
+            const textArea = document.createElement('textarea');
+            textArea.value = text;
+            document.body.appendChild(textArea);
+            textArea.select();
+            document.execCommand('copy');
+            document.body.removeChild(textArea);
+            status = `📋 Copied to clipboard: "${text.substring(0, 30)}${text.length > 30 ? '...' : ''}"`;
         }
     }
 
@@ -201,8 +241,15 @@
                 <div class="panel receive-panel">
                     {#if receivedText}
                         <div class="received-text">
-                            <h3>Latest Received:</h3>
-                            <div class="message">{receivedText}</div>
+                            <div class="received-header">
+                                <h3>Latest Received:</h3>
+                                <button on:click={() => copyToClipboard(receivedText)} class="btn btn-small copy-btn">
+                                    📋 Copy
+                                </button>
+                            </div>
+                            <div class="message-container">
+                                <div class="message">{receivedText}</div>
+                            </div>
                         </div>
                     {/if}
                     
@@ -214,8 +261,13 @@
                             </div>
                             {#each receivedMessages as message}
                                 <div class="message-item">
-                                    <div class="message-text">{message.text}</div>
-                                    <div class="message-time">{message.timestamp.toLocaleTimeString()}</div>
+                                    <div class="message-content">
+                                        <div class="message-text">{message.text}</div>
+                                        <div class="message-time">{message.timestamp.toLocaleTimeString()}</div>
+                                    </div>
+                                    <button on:click={() => copyToClipboard(message.text)} class="btn btn-small copy-btn-small">
+                                        📋
+                                    </button>
                                 </div>
                             {/each}
                         </div>
@@ -367,6 +419,7 @@
                     title="Protocol Help & Guide">
                     ❓ Help
                 </button>
+                
             </div>
             
             <!-- Progress bar appears below buttons -->
@@ -700,12 +753,33 @@
         border-left: 4px solid #27ae60;
     }
 
+    .received-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-bottom: 10px;
+    }
+
+    .received-header h3 {
+        margin: 0;
+    }
+
+    .message-container {
+        max-height: 200px;
+        overflow-y: auto;
+        padding: 5px;
+        background: rgba(255, 255, 255, 0.7);
+        border-radius: 4px;
+    }
+
     .message {
         font-family: monospace;
-        font-size: 16px;
+        font-size: 14px;
         font-weight: bold;
         color: #2c3e50;
-        word-break: break-all;
+        word-break: break-word;
+        line-height: 1.4;
+        white-space: pre-wrap;
     }
 
     .message-history {
@@ -731,17 +805,61 @@
         border-radius: 6px;
         padding: 10px;
         margin-bottom: 10px;
+        display: flex;
+        justify-content: space-between;
+        align-items: flex-start;
+        gap: 10px;
+    }
+
+    .message-content {
+        flex: 1;
+        min-width: 0;
     }
 
     .message-text {
         font-family: monospace;
         font-weight: bold;
         margin-bottom: 5px;
+        word-break: break-word;
+        white-space: pre-wrap;
+        line-height: 1.3;
     }
 
     .message-time {
         font-size: 12px;
         color: #6c757d;
+    }
+
+    .copy-btn {
+        background: #17a2b8;
+        color: white;
+        border: none;
+        padding: 6px 12px;
+        font-size: 12px;
+        border-radius: 4px;
+        cursor: pointer;
+        transition: background 0.3s;
+    }
+
+    .copy-btn:hover {
+        background: #138496;
+    }
+
+    .copy-btn-small {
+        background: #17a2b8;
+        color: white;
+        border: none;
+        padding: 4px 8px;
+        font-size: 10px;
+        border-radius: 3px;
+        cursor: pointer;
+        transition: background 0.3s;
+        flex-shrink: 0;
+        min-width: 30px;
+    }
+
+    .copy-btn-small:hover {
+        background: #138496;
     }
 
 
@@ -888,6 +1006,13 @@
             max-height: calc(85vh - 80px);
         }
         
+        .message-container {
+            max-height: 150px;
+        }
+        
+        .message-history {
+            max-height: 250px;
+        }
 
         textarea, .protocol-select {
             font-size: 16px; /* Prevent zoom on iOS */
