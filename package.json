@@ -21,7 +21,6 @@
 		"vite": "^7.0.4"
 	},
 	"dependencies": {
-		"ggwave": "^0.4.0",
-		"lz-string": "^1.5.0"
+		"ggwave": "^0.4.0"
 	}
 }
