@@ -16,6 +16,7 @@ export class GGWaveService {
     private parameters: any;
     private audioContext: AudioContext | null = null;
     private isInitialized: boolean = false;
+    private currentProtocol: string | null = null;
 
     // === Large message support ===
     private static readonly CHUNK_SIZE = 75; // bytes per data packet (before Base64)
@@ -34,7 +35,7 @@ export class GGWaveService {
         OVERLAPPING_3: { groupSize: 3, parityCount: 1, overlap: true, name: 'Overlapping 3+1' }
     } as const;
     
-    public static readonly DEFAULT_FEC_SCHEME = GGWaveService.FEC_SCHEMES.BASIC_3;
+    public static readonly DEFAULT_FEC_SCHEME = GGWaveService.FEC_SCHEMES.OVERLAPPING_3;
 
     // === SEQUENCIA Parser ===
     /**
@@ -97,6 +98,80 @@ export class GGWaveService {
             return seq; // Return original if invalid
         }
         return GGWaveService.createParityKey(parsed.inicio, parsed.fim, parsed.tipo);
+    }
+
+    /**
+     * Generates deterministic OVERLAPPING_3 groups following the protocol specification
+     * CRITICAL: This algorithm MUST match exactly between transmitter and receiver
+     * ORDER: ALL main groups first, then ALL overlapping groups
+     * 
+     * @param totalPackets Total number of data packets
+     * @returns Array of group definitions [start, end, type] in transmission order
+     */
+    private static generateOverlappingGroups(totalPackets: number): Array<{start: number, end: number, type: string}> {
+        const mainGroups: Array<{start: number, end: number, type: string}> = [];
+        const overlappingGroups: Array<{start: number, end: number, type: string}> = [];
+        const mainGroupKeys = new Set<string>();
+        
+        // 1. GRUPOS PRINCIPAIS (tipo=0): [1-3], [4-6], [7-9], ...
+        // Generate ALL main groups first
+        for (let i = 1; i <= totalPackets; i += 3) {
+            const start = i;
+            const end = Math.min(i + 2, totalPackets);
+            const key = `${start}-${end}`;
+            
+            mainGroups.push({ start, end, type: "0" });
+            mainGroupKeys.add(key);
+        }
+        
+        // 2. GRUPOS OVERLAPPING (tipos O0, O1, O2, ...): [2-4], [3-5], [5-7], [6-8], ...
+        // Generate ALL overlapping groups after (filter duplicates)
+        let oIndex = 0;
+        for (let i = 2; i <= totalPackets; i++) {
+            if (i + 2 <= totalPackets) {
+                const start = i;
+                const end = i + 2;
+                const key = `${start}-${end}`;
+                
+                if (!mainGroupKeys.has(key)) {
+                    overlappingGroups.push({ start, end, type: `O${oIndex}` });
+                }
+                oIndex++;
+            }
+        }
+        
+        // 3. ORDEM CRÍTICA: Principais primeiro, overlapping depois
+        return [...mainGroups, ...overlappingGroups];
+    }
+
+    /**
+     * Generates FEC groups for a given scheme and total packets
+     * Returns groups in transmission order: main groups first, then overlapping
+     */
+    private static generateFECGroups(totalPackets: number, fecScheme: typeof GGWaveService.FEC_SCHEMES[keyof typeof GGWaveService.FEC_SCHEMES]): Array<{start: number, end: number, type: string}> {
+        if (fecScheme.groupSize === 0) {
+            return []; // No FEC
+        }
+        
+        if (fecScheme.overlap) {
+            // Use deterministic overlapping algorithm
+            return GGWaveService.generateOverlappingGroups(totalPackets);
+        } else {
+            // Standard FEC groups
+            const groups: Array<{start: number, end: number, type: string}> = [];
+            
+            for (let i = 0; i < totalPackets; i += fecScheme.groupSize) {
+                const start = i + 1;
+                const end = Math.min(i + fecScheme.groupSize, totalPackets);
+                
+                // Add groups for each parity type
+                for (let p = 0; p < fecScheme.parityCount; p++) {
+                    groups.push({ start, end, type: p.toString() });
+                }
+            }
+            
+            return groups;
+        }
     }
 
     // Map of active receive sessions
@@ -815,6 +890,63 @@ export class GGWaveService {
         return Math.max(calculatedTimeout, GGWaveService.MIN_SESSION_TIMEOUT_MS);
     }
 
+    /**
+     * Robust Base64 validation and decoding
+     * @param base64String The Base64 string to validate and decode
+     * @returns Uint8Array if valid, null if invalid
+     */
+    private static validateAndDecodeBase64(base64String: string): Uint8Array | null {
+        try {
+            // Check if string contains only valid Base64 characters
+            const base64Regex = /^[A-Za-z0-9+/]*={0,2}$/;
+            if (!base64Regex.test(base64String)) {
+                console.warn(`Invalid Base64 characters in: ${base64String.substring(0, 50)}...`);
+                return null;
+            }
+            
+            // Check if length is valid (must be multiple of 4 after padding)
+            if (base64String.length % 4 !== 0) {
+                console.warn(`Invalid Base64 length: ${base64String.length} (must be multiple of 4)`);
+                return null;
+            }
+            
+            // Attempt decode
+            const decoded = atob(base64String);
+            return Uint8Array.from(decoded, c => c.charCodeAt(0));
+            
+        } catch (error) {
+            console.warn(`Base64 decode error: ${error}`, base64String.substring(0, 50));
+            return null;
+        }
+    }
+
+    /**
+     * Infer protocol type from current listening mode or use conservative default
+     */
+    private inferCurrentProtocol(): string {
+        // If we have a recorded current protocol, use it
+        if (this.currentProtocol) {
+            return this.currentProtocol;
+        }
+        
+        // Try to infer from current ggwave mode (if available)
+        if (this.instance) {
+            try {
+                const currentMode = this.instance.getDefaultMode?.() || 0;
+                // This is a heuristic - map mode numbers to protocol types
+                // Mode 0-3 are typically ultrasonic, 4-7 audible, etc.
+                if (currentMode <= 1) return 'ULTRASONIC_FASTEST';
+                if (currentMode <= 3) return 'ULTRASONIC_NORMAL';
+                return 'AUDIBLE_NORMAL';
+            } catch (e) {
+                console.warn('Could not infer protocol from ggwave instance');
+            }
+        }
+        
+        // Conservative default - assume slower protocol for safety
+        return 'NORMAL';
+    }
+
     // ===================== Sender side =====================
 
     /**
@@ -835,6 +967,9 @@ export class GGWaveService {
             fecInfo?: { scheme: string; groupSize: number; parityCount: number };
         }) => void
     ): Promise<void> {
+        // Track current protocol for adaptive timeouts
+        this.currentProtocol = protocolName;
+        
         if (!this.isInitialized) {
             await this.initialize();
         }
@@ -873,67 +1008,54 @@ export class GGWaveService {
         });
         await this.transmitPacket(startPacket, protocolName);
 
-        // 2) DATA packets + parity per group
+        // 2) DATA packets
         for (let i = 0; i < total; i++) {
             const seqNum = i + 1;
             const chunkBase64 = btoa(String.fromCharCode(...chunks[i]));
             const dataPacket = `D:${id}:${seqNum}:${chunkBase64}`;
             onProgress?.({ type: 'data', current: seqNum, total, sessionId: id, packet: dataPacket });
             await this.transmitPacket(dataPacket, protocolName);
+        }
 
-            // Send parity based on FEC scheme
-            if (fecScheme.groupSize > 0) {
-                const inGroupIndex = i % fecScheme.groupSize;
-                const isGroupEnd = inGroupIndex === fecScheme.groupSize - 1 || i === total - 1;
+        // 3) PARITY packets - deterministic order following specification
+        if (fecScheme.groupSize > 0) {
+            const fecGroups = GGWaveService.generateFECGroups(total, fecScheme);
+            console.log(`FEC Groups for ${total} packets with ${fecScheme.name}:`, fecGroups);
+            
+            // Send parity packets in deterministic order
+            for (const group of fecGroups) {
+                const groupChunks = chunks.slice(group.start - 1, group.end);
                 
-                if (isGroupEnd) {
-                    const groupStart = i - inGroupIndex; // inclusive
-                    const groupEnd = Math.min(i, total - 1); // inclusive
-                    const groupChunks = chunks.slice(groupStart, groupEnd + 1);
-                    
-                    // Generate parity data using the selected scheme
-                    const parities = GGWaveService.generateParityData(groupChunks, fecScheme);
-                    
-                    // Send each parity packet
-                    for (let p = 0; p < parities.length; p++) {
-                        const parityBase64 = btoa(String.fromCharCode(...parities[p]));
-                        const rangeStr = GGWaveService.createParityKey(groupStart + 1, groupEnd + 1, p.toString());
-                        const parityPacket = `P:${id}:${rangeStr}:${parityBase64}`;
-                        onProgress?.({ 
-                            type: 'parity', 
-                            current: Math.floor(i / fecScheme.groupSize) + 1, 
-                            total: Math.ceil(total / fecScheme.groupSize), 
-                            sessionId: id, 
-                            packet: parityPacket 
-                        });
-                        await this.transmitPacket(parityPacket, protocolName);
-                    }
-                }
+                // Generate parity data for this specific group
+                const parityCount = group.type.startsWith('O') ? 1 : (fecScheme.parityCount || 1);
+                const parities = GGWaveService.generateParityData(groupChunks, {
+                    ...fecScheme,
+                    parityCount
+                });
                 
-                // Overlapping groups for enhanced redundancy
-                if (fecScheme.overlap && i >= fecScheme.groupSize - 1 && i < total - 1) {
-                    const overlapStart = i - fecScheme.groupSize + 2;
-                    const overlapEnd = Math.min(i + 1, total - 1);
-                    const overlapChunks = chunks.slice(overlapStart, overlapEnd + 1);
+                // For overlapping groups, only send the primary parity (index 0)
+                const parityIndex = group.type.startsWith('O') ? 0 : parseInt(group.type);
+                if (parityIndex < parities.length) {
+                    const parityBase64 = btoa(String.fromCharCode(...parities[parityIndex]));
+                    const rangeStr = GGWaveService.createParityKey(group.start, group.end, group.type);
+                    const parityPacket = `P:${id}:${rangeStr}:${parityBase64}`;
                     
-                    if (overlapChunks.length >= 2) {
-                        const overlapParities = GGWaveService.generateParityData(overlapChunks, {
-                            ...fecScheme,
-                            parityCount: 1 // Only primary parity for overlapping groups
-                        });
-                        
-                        for (let p = 0; p < overlapParities.length; p++) {
-                            const parityBase64 = btoa(String.fromCharCode(...overlapParities[p]));
-                            const rangeStr = GGWaveService.createParityKey(overlapStart + 1, overlapEnd + 1, `O${p}`);
-                            const parityPacket = `P:${id}:${rangeStr}:${parityBase64}`;
-                            await this.transmitPacket(parityPacket, protocolName);
-                        }
-                    }
+                    console.log(`Sending parity packet: ${rangeStr} for group [${group.start}-${group.end}]`);
+                    
+                    onProgress?.({ 
+                        type: 'parity', 
+                        current: fecGroups.indexOf(group) + 1, 
+                        total: fecGroups.length, 
+                        sessionId: id, 
+                        packet: parityPacket 
+                    });
+                    
+                    await this.transmitPacket(parityPacket, protocolName);
                 }
             }
         }
 
-        // 3) END packet
+        // 4) END packet
         const endPacket = `E:${id}::`;
         onProgress?.({ type: 'end', current: total, total, sessionId: id, packet: endPacket });
         await this.transmitPacket(endPacket, protocolName);
@@ -1020,7 +1142,8 @@ export class GGWaveService {
                     this.receiveSessions.delete(sessionId);
                 }
 
-                const timeoutMs = GGWaveService.calculateTimeout(total, 'NORMAL'); // Assume slowest protocol for safety
+                const inferredProtocol = this.inferCurrentProtocol();
+                const timeoutMs = GGWaveService.calculateTimeout(total, inferredProtocol);
                 console.log(`Session ${sessionId} timeout set to ${timeoutMs}ms for ${total} packets`);
                 const timeoutId = setTimeout(() => {
                     console.warn(`Session ${sessionId} timed out after ${timeoutMs}ms`);
@@ -1073,9 +1196,9 @@ export class GGWaveService {
                 }
                 sess.receivedPackets.add(packetId);
 
-                // Decode Base64 data
-                try {
-                    const dataBytes = Uint8Array.from(atob(dataBase64), c => c.charCodeAt(0));
+                // Decode Base64 data with validation
+                const dataBytes = GGWaveService.validateAndDecodeBase64(dataBase64);
+                if (dataBytes) {
                     sess.chunks.set(seqNum, dataBytes);
                     
                     // Report progress
@@ -1099,8 +1222,8 @@ export class GGWaveService {
                         chunks: chunksStatus,
                         parity: parityStatus
                     });
-                } catch (e) {
-                    console.warn(`Invalid Base64 in DATA packet: ${dataBase64}`);
+                } else {
+                    console.warn(`Invalid Base64 in DATA packet: ${dataBase64.substring(0, 50)}...`);
                     return null;
                 }
                 break;
@@ -1121,9 +1244,9 @@ export class GGWaveService {
                 }
                 sess.receivedPackets.add(packetId);
 
-                // Decode Base64 parity
-                try {
-                    const parityBytes = Uint8Array.from(atob(parityBase64), c => c.charCodeAt(0));
+                // Decode Base64 parity with validation
+                const parityBytes = GGWaveService.validateAndDecodeBase64(parityBase64);
+                if (parityBytes) {
                     // Normalize the range string to ensure consistent format
                     const normalizedRangeStr = GGWaveService.normalizeSequencia(rangeStr);
                     sess.parity.set(normalizedRangeStr, parityBytes);
@@ -1149,8 +1272,8 @@ export class GGWaveService {
                         chunks: chunksStatus,
                         parity: parityStatus
                     });
-                } catch (e) {
-                    console.warn(`Invalid Base64 in PARITY packet: ${parityBase64}`);
+                } else {
+                    console.warn(`Invalid Base64 in PARITY packet: ${parityBase64.substring(0, 50)}...`);
                     return null;
                 }
                 break;
@@ -1231,26 +1354,29 @@ export class GGWaveService {
                 }
             }
             
-            // Try overlapping group recovery if enabled
+            // Try overlapping group recovery using deterministic algorithm
             if (sess.fecScheme.overlap) {
-                for (let i = sess.fecScheme.groupSize; i < sess.total; i++) {
-                    const overlapStart = i - sess.fecScheme.groupSize + 2;
-                    const overlapEnd = Math.min(i + 1, sess.total);
+                console.log(`Attempting overlapping FEC recovery for ${sess.total} packets`);
+                
+                // Generate the same deterministic groups that transmitter used
+                const overlappingGroups = GGWaveService.generateOverlappingGroups(sess.total);
+                const overlappingOnlyGroups = overlappingGroups.filter(group => group.type.startsWith('O'));
+                
+                console.log(`Generated ${overlappingOnlyGroups.length} overlapping groups:`, overlappingOnlyGroups);
+                
+                for (const group of overlappingOnlyGroups) {
+                    const recovered = GGWaveService.recoverChunks(
+                        sess.chunks,
+                        sess.parity,
+                        group.start,
+                        group.end - group.start + 1,
+                        { ...sess.fecScheme, parityCount: 1 }
+                    );
                     
-                    if (overlapEnd > overlapStart) {
-                        const recovered = GGWaveService.recoverChunks(
-                            sess.chunks,
-                            sess.parity,
-                            overlapStart,
-                            overlapEnd - overlapStart + 1,
-                            { ...sess.fecScheme, parityCount: 1 }
-                        );
-                        
-                        for (const [index, data] of recovered) {
-                            if (!sess.chunks.has(index)) {
-                                sess.chunks.set(index, data);
-                                console.log(`Overlapping FEC recovered packet ${index} for session ${sessionId}`);
-                            }
+                    for (const [index, data] of recovered) {
+                        if (!sess.chunks.has(index)) {
+                            sess.chunks.set(index, data);
+                            console.log(`Overlapping FEC recovered packet ${index} for session ${sessionId} using group [${group.start}-${group.end}]`);
                         }
                     }
                 }
