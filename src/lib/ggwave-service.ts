@@ -1,4 +1,6 @@
 import ggwaveFactory from 'ggwave';
+import CryptoJS from 'crypto-js';
+import { gunzip, gzip } from 'fflate';
 
 export class GGWaveService {
     private ggwave: any;
@@ -6,6 +8,37 @@ export class GGWaveService {
     private parameters: any;
     private audioContext: AudioContext | null = null;
     private isInitialized: boolean = false;
+
+    // === Large message support ===
+    private static readonly CHUNK_SIZE = 75; // bytes per data packet (before Base64)
+    private static readonly SESSION_TIMEOUT_BASE_MS = 30_000; // base timeout (30s)
+    private static readonly SESSION_TIMEOUT_PER_PACKET_MS = 5_000; // per packet timeout (5s per packet)
+    private static readonly MIN_SESSION_TIMEOUT_MS = 60_000; // minimum 1 minute timeout
+    
+    // === FEC Configuration ===
+    public static readonly FEC_SCHEMES = {
+        NONE: { groupSize: 0, parityCount: 0, name: 'No FEC' },
+        BASIC_2: { groupSize: 2, parityCount: 1, name: 'Basic 2+1' },
+        BASIC_3: { groupSize: 3, parityCount: 1, name: 'Basic 3+1' },
+        BASIC_4: { groupSize: 4, parityCount: 1, name: 'Basic 4+1' },
+        ENHANCED_2: { groupSize: 2, parityCount: 2, name: 'Enhanced 2+2' },
+        ENHANCED_3: { groupSize: 3, parityCount: 2, name: 'Enhanced 3+2' },
+        OVERLAPPING_3: { groupSize: 3, parityCount: 1, overlap: true, name: 'Overlapping 3+1' }
+    } as const;
+    
+    public static readonly DEFAULT_FEC_SCHEME = GGWaveService.FEC_SCHEMES.BASIC_3;
+
+    // Map of active receive sessions
+    private receiveSessions: Map<string, {
+        total: number;
+        expectedHash: string;
+        flags: string;
+        fecScheme: typeof GGWaveService.FEC_SCHEMES[keyof typeof GGWaveService.FEC_SCHEMES];
+        chunks: Map<number, Uint8Array>; // seq -> raw data bytes
+        parity: Map<string, Uint8Array>; // "group-type" -> parity bytes
+        timeoutId: ReturnType<typeof setTimeout>;
+        receivedPackets: Set<string>; // for duplicate detection
+    }> = new Map();
 
     constructor() {
         this.ggwave = null;
@@ -160,7 +193,18 @@ export class GGWaveService {
         }
     }
 
-    async startListening(callback: (text: string) => void): Promise<void> {
+    async startListening(
+        callback: (text: string) => void,
+        onProgress?: (progress: {
+            type: 'start' | 'data' | 'parity' | 'end' | 'complete';
+            sessionId: string;
+            packet: string;
+            received: number;
+            total: number;
+            chunks: { [key: number]: boolean };
+            parity: { [key: string]: boolean };
+        }) => void
+    ): Promise<void> {
         if (!this.isInitialized) {
             await this.initialize();
         }
@@ -177,7 +221,9 @@ export class GGWaveService {
                 audio: {
                     echoCancellation: false,
                     autoGainControl: false,
-                    noiseSuppression: false
+                    noiseSuppression: false,
+                    sampleRate: 48000,
+                    channelCount: 1
                 }
             };
 
@@ -185,9 +231,12 @@ export class GGWaveService {
             const mediaStreamSource = this.audioContext!.createMediaStreamSource(stream);
 
             let recorder: ScriptProcessorNode;
-            const bufferSize = 1024;
+            const bufferSize = 4096; // Increased buffer size for better stability
             const numberOfInputChannels = 1;
             const numberOfOutputChannels = 1;
+            
+            console.log('Audio stream created with constraints:', constraints);
+            console.log('Media stream tracks:', stream.getTracks().map(t => ({ kind: t.kind, label: t.label, settings: t.getSettings() })));
 
             if (this.audioContext!.createScriptProcessor) {
                 recorder = this.audioContext!.createScriptProcessor(
@@ -215,30 +264,24 @@ export class GGWaveService {
                     );
 
                     if (result && result.length > 0) {
-                        try {
-                            // Try UTF-8 decoding first (standard approach)
-                            const decodedText = new TextDecoder("utf-8").decode(result);
-                            
-                            console.log('📥 Received message:', decodedText);
-                            callback(decodedText);
-                        } catch (utfError) {
-                            // Fallback: Try Latin-1 decoding for non-UTF8 data
-                            try {
-                                const decodedText = new TextDecoder("latin1").decode(result);
-                                
-                                console.log('📥 Received message (latin1):', decodedText);
-                                callback(decodedText);
-                            } catch (latinError) {
-                                // Final fallback: Convert raw bytes to string
-                                const rawString = Array.from(result, byte => String.fromCharCode(byte)).join('');
-                                
-                                console.log('📥 Received message (raw):', rawString);
-                                callback(rawString);
+                        const decodedText = new TextDecoder('utf-8').decode(result);
+                        console.log('📥 Received packet:', decodedText);
+
+                        // Handle the async call without blocking the audio processing
+                        this.handleReceivedPacket(decodedText, onProgress).then((complete) => {
+                            if (complete) {
+                                console.log('📥 Reconstructed message:', complete);
+                                callback(complete);
                             }
-                        }
+                        }).catch((error) => {
+                            console.error('Error handling received packet:', error);
+                        });
                     }
                 } catch (error) {
-                    // Silently ignore decode errors (expected for non-ggwave audio)
+                    // Only log decode errors occasionally to avoid spam
+                    if (Math.random() < 0.01) {
+                        console.debug('Decode attempt failed (this is normal for background noise)');
+                    }
                 }
             };
 
@@ -467,4 +510,855 @@ export class GGWaveService {
         return availableProtocols;
     }
 
+    /* =====================
+       * Utility functions *
+       ===================== */
+
+    // Generate a unique session ID (timestamp-nonce format)
+    private static generateSessionId(): string {
+        const timestamp = Math.floor(Date.now() / 1000).toString();
+        const nonce = Math.floor(Math.random() * 1000000).toString().padStart(6, '0');
+        return `${timestamp}-${nonce}`;
+    }
+
+    // Compute MD5 hash in Base64 format for entire message
+    private static md5Base64(data: Uint8Array): string {
+        const wordArray = CryptoJS.lib.WordArray.create(data);
+        const hash = CryptoJS.MD5(wordArray);
+        return CryptoJS.enc.Base64.stringify(hash);
+    }
+
+    // Split bytes into fixed-size chunks
+    private static chunkBytes(data: Uint8Array, size: number): Uint8Array[] {
+        const chunks: Uint8Array[] = [];
+        for (let i = 0; i < data.length; i += size) {
+            chunks.push(data.slice(i, i + size));
+        }
+        return chunks;
+    }
+
+    // XOR multiple equal-length byte arrays with padding
+    private static xorBytes(chunks: Uint8Array[], size: number): Uint8Array {
+        const result = new Uint8Array(size);
+        for (const chunk of chunks) {
+            const paddedChunk = new Uint8Array(size);
+            paddedChunk.set(chunk);
+            for (let i = 0; i < size; i++) {
+                result[i] ^= paddedChunk[i];
+            }
+        }
+        return result;
+    }
+    
+    // Generate parity data for a group using specified scheme
+    private static generateParityData(chunks: Uint8Array[], scheme: typeof GGWaveService.FEC_SCHEMES[keyof typeof GGWaveService.FEC_SCHEMES]): Uint8Array[] {
+        const parities: Uint8Array[] = [];
+        
+        if (scheme.parityCount === 0) {
+            return parities;
+        }
+        
+        // Primary parity: XOR of all chunks
+        const primaryParity = GGWaveService.xorBytes(chunks, GGWaveService.CHUNK_SIZE);
+        parities.push(primaryParity);
+        
+        // Secondary parity for enhanced schemes
+        if (scheme.parityCount >= 2) {
+            // Weighted XOR: each chunk multiplied by its position (simple Reed-Solomon-like)
+            const secondaryParity = new Uint8Array(GGWaveService.CHUNK_SIZE);
+            for (let i = 0; i < chunks.length; i++) {
+                const weight = i + 1;
+                const paddedChunk = new Uint8Array(GGWaveService.CHUNK_SIZE);
+                paddedChunk.set(chunks[i]);
+                
+                for (let j = 0; j < GGWaveService.CHUNK_SIZE; j++) {
+                    secondaryParity[j] ^= (paddedChunk[j] * weight) & 0xFF;
+                }
+            }
+            parities.push(secondaryParity);
+        }
+        
+        return parities;
+    }
+    
+    // Attempt to recover missing chunks using available parity data
+    private static recoverChunks(
+        chunks: Map<number, Uint8Array>, 
+        parity: Map<string, Uint8Array>, 
+        groupStart: number, 
+        groupSize: number, 
+        scheme: typeof GGWaveService.FEC_SCHEMES[keyof typeof GGWaveService.FEC_SCHEMES]
+    ): Map<number, Uint8Array> {
+        const recovered = new Map<number, Uint8Array>();
+        
+        if (scheme.parityCount === 0) {
+            return recovered;
+        }
+        
+        const groupEnd = groupStart + groupSize - 1;
+        const missingIndices: number[] = [];
+        const presentChunks: { index: number, data: Uint8Array }[] = [];
+        
+        // Identify missing and present chunks
+        for (let i = groupStart; i <= groupEnd; i++) {
+            if (chunks.has(i)) {
+                presentChunks.push({ index: i, data: chunks.get(i)! });
+            } else {
+                missingIndices.push(i);
+            }
+        }
+        
+        // Try to recover based on available parity
+        const primaryParityKey = `${groupStart}-${groupEnd}-0`;
+        const secondaryParityKey = `${groupStart}-${groupEnd}-1`;
+        
+        // Single error correction with primary parity
+        if (missingIndices.length === 1 && parity.has(primaryParityKey)) {
+            const missingIndex = missingIndices[0];
+            const primaryParity = parity.get(primaryParityKey)!;
+            
+            const recoveredData = primaryParity.slice();
+            for (const { data } of presentChunks) {
+                const paddedData = new Uint8Array(GGWaveService.CHUNK_SIZE);
+                paddedData.set(data);
+                
+                for (let j = 0; j < GGWaveService.CHUNK_SIZE; j++) {
+                    recoveredData[j] ^= paddedData[j];
+                }
+            }
+            
+            // Remove trailing zeros
+            let actualLength = recoveredData.length;
+            while (actualLength > 0 && recoveredData[actualLength - 1] === 0) {
+                actualLength--;
+            }
+            
+            recovered.set(missingIndex, recoveredData.slice(0, actualLength));
+        }
+        
+        // Double error correction with enhanced schemes
+        else if (missingIndices.length === 2 && scheme.parityCount >= 2 && 
+                 parity.has(primaryParityKey) && parity.has(secondaryParityKey)) {
+            
+            // This is a simplified approach - real Reed-Solomon would be more complex
+            // For now, we'll attempt recovery using both parities
+            const [missing1, missing2] = missingIndices;
+            const primaryParity = parity.get(primaryParityKey)!;
+            const secondaryParity = parity.get(secondaryParityKey)!;
+            
+            // Solve the system of equations (simplified)
+            // This is a basic implementation - in practice, you'd use proper Galois field math
+            try {
+                const recoveredData1 = new Uint8Array(GGWaveService.CHUNK_SIZE);
+                const recoveredData2 = new Uint8Array(GGWaveService.CHUNK_SIZE);
+                
+                // Apply present chunks to both parities
+                const adjustedPrimary = primaryParity.slice();
+                const adjustedSecondary = secondaryParity.slice();
+                
+                for (const { index, data } of presentChunks) {
+                    const paddedData = new Uint8Array(GGWaveService.CHUNK_SIZE);
+                    paddedData.set(data);
+                    const weight = index - groupStart + 1;
+                    
+                    for (let j = 0; j < GGWaveService.CHUNK_SIZE; j++) {
+                        adjustedPrimary[j] ^= paddedData[j];
+                        adjustedSecondary[j] ^= (paddedData[j] * weight) & 0xFF;
+                    }
+                }
+                
+                // Solve for the two missing chunks (simplified approach)
+                const weight1 = missing1 - groupStart + 1;
+                const weight2 = missing2 - groupStart + 1;
+                
+                for (let j = 0; j < GGWaveService.CHUNK_SIZE; j++) {
+                    // Simplified solution - in practice, use proper linear algebra
+                    const a = adjustedPrimary[j];
+                    const b = adjustedSecondary[j];
+                    
+                    // Solve: x + y = a, w1*x + w2*y = b
+                    if (weight1 !== weight2) {
+                        const y = ((b - weight1 * a) / (weight2 - weight1)) & 0xFF;
+                        const x = (a ^ y) & 0xFF;
+                        
+                        recoveredData1[j] = x;
+                        recoveredData2[j] = y;
+                    }
+                }
+                
+                // Trim trailing zeros
+                let len1 = recoveredData1.length;
+                while (len1 > 0 && recoveredData1[len1 - 1] === 0) len1--;
+                
+                let len2 = recoveredData2.length;
+                while (len2 > 0 && recoveredData2[len2 - 1] === 0) len2--;
+                
+                recovered.set(missing1, recoveredData1.slice(0, len1));
+                recovered.set(missing2, recoveredData2.slice(0, len2));
+            } catch (error) {
+                console.warn('Double error correction failed:', error);
+            }
+        }
+        
+        return recovered;
+    }
+
+    // Compress data using gzip
+    private static compressData(data: Uint8Array): Promise<Uint8Array> {
+        return new Promise((resolve, reject) => {
+            gzip(data, (err, compressed) => {
+                if (err) reject(err);
+                else resolve(compressed);
+            });
+        });
+    }
+
+    // Decompress data using gzip
+    private static decompressData(data: Uint8Array): Promise<Uint8Array> {
+        return new Promise((resolve, reject) => {
+            gunzip(data, (err, decompressed) => {
+                if (err) reject(err);
+                else resolve(decompressed);
+            });
+        });
+    }
+
+    // Calculate adaptive timeout based on packet count and protocol speed
+    private static calculateTimeout(totalPackets: number, protocolName?: string): number {
+        let multiplier = 1;
+        
+        // Adjust timeout based on protocol speed
+        if (protocolName) {
+            if (protocolName.includes('NORMAL')) {
+                multiplier = 3; // Normal protocols are slower
+            } else if (protocolName.includes('FAST') && !protocolName.includes('FASTEST')) {
+                multiplier = 2; // Fast protocols are medium speed
+            } else if (protocolName.includes('FASTEST')) {
+                multiplier = 1; // Fastest protocols are quick
+            }
+        }
+        
+        const calculatedTimeout = GGWaveService.SESSION_TIMEOUT_BASE_MS + 
+                                 (totalPackets * GGWaveService.SESSION_TIMEOUT_PER_PACKET_MS * multiplier);
+        
+        return Math.max(calculatedTimeout, GGWaveService.MIN_SESSION_TIMEOUT_MS);
+    }
+
+    // ===================== Sender side =====================
+
+    /**
+     * Transmit arbitrarily large data by fragmenting into multiple GGWave packets.
+     * The method blocks until transmission of all packets completes.
+     */
+    async sendLargeData(
+        message: string, 
+        protocolName: string = 'GGWAVE_PROTOCOL_ULTRASONIC_FASTEST', 
+        compress: boolean = false,
+        fecScheme: typeof GGWaveService.FEC_SCHEMES[keyof typeof GGWaveService.FEC_SCHEMES] = GGWaveService.DEFAULT_FEC_SCHEME,
+        onProgress?: (progress: {
+            type: 'start' | 'data' | 'parity' | 'end';
+            current: number;
+            total: number;
+            sessionId: string;
+            packet: string;
+            fecInfo?: { scheme: string; groupSize: number; parityCount: number };
+        }) => void
+    ): Promise<void> {
+        if (!this.isInitialized) {
+            await this.initialize();
+        }
+
+        const id = GGWaveService.generateSessionId();
+        let data = new TextEncoder().encode(message);
+        let flags = '';
+
+        // Apply compression if requested
+        if (compress) {
+            data = await GGWaveService.compressData(data);
+            flags = 'C';
+        }
+
+        const fullHash = GGWaveService.md5Base64(data);
+        const chunks = GGWaveService.chunkBytes(data, GGWaveService.CHUNK_SIZE);
+        const total = chunks.length;
+
+        // Add FEC scheme to flags
+        const fecFlag = `F${Object.entries(GGWaveService.FEC_SCHEMES).find(([_, scheme]) => scheme === fecScheme)?.[0] || 'BASIC_3'}`;
+        const allFlags = [flags, fecFlag].filter(Boolean).join(',');
+
+        // 1) START packet
+        const startPacket = allFlags ? `S:${id}::${fullHash}:${total}:${allFlags}` : `S:${id}::${fullHash}:${total}`;
+        
+        console.log(`Sending START packet: ${startPacket}`);
+        console.log(`Compression flag: ${compress ? 'YES' : 'NO'}, Data size: ${data.length} bytes`);
+        
+        onProgress?.({ 
+            type: 'start', 
+            current: 0, 
+            total, 
+            sessionId: id, 
+            packet: startPacket,
+            fecInfo: { scheme: fecScheme.name, groupSize: fecScheme.groupSize, parityCount: fecScheme.parityCount }
+        });
+        await this.transmitPacket(startPacket, protocolName);
+
+        // 2) DATA packets + parity per group
+        for (let i = 0; i < total; i++) {
+            const seqNum = i + 1;
+            const chunkBase64 = btoa(String.fromCharCode(...chunks[i]));
+            const dataPacket = `D:${id}:${seqNum}:${chunkBase64}`;
+            onProgress?.({ type: 'data', current: seqNum, total, sessionId: id, packet: dataPacket });
+            await this.transmitPacket(dataPacket, protocolName);
+
+            // Send parity based on FEC scheme
+            if (fecScheme.groupSize > 0) {
+                const inGroupIndex = i % fecScheme.groupSize;
+                const isGroupEnd = inGroupIndex === fecScheme.groupSize - 1 || i === total - 1;
+                
+                if (isGroupEnd) {
+                    const groupStart = i - inGroupIndex; // inclusive
+                    const groupEnd = Math.min(i, total - 1); // inclusive
+                    const groupChunks = chunks.slice(groupStart, groupEnd + 1);
+                    
+                    // Generate parity data using the selected scheme
+                    const parities = GGWaveService.generateParityData(groupChunks, fecScheme);
+                    
+                    // Send each parity packet
+                    for (let p = 0; p < parities.length; p++) {
+                        const parityBase64 = btoa(String.fromCharCode(...parities[p]));
+                        const rangeStr = `${groupStart + 1}-${groupEnd + 1}-${p}`;
+                        const parityPacket = `P:${id}:${rangeStr}:${parityBase64}`;
+                        onProgress?.({ 
+                            type: 'parity', 
+                            current: Math.floor(i / fecScheme.groupSize) + 1, 
+                            total: Math.ceil(total / fecScheme.groupSize), 
+                            sessionId: id, 
+                            packet: parityPacket 
+                        });
+                        await this.transmitPacket(parityPacket, protocolName);
+                    }
+                }
+                
+                // Overlapping groups for enhanced redundancy
+                if (fecScheme.overlap && i >= fecScheme.groupSize - 1 && i < total - 1) {
+                    const overlapStart = i - fecScheme.groupSize + 2;
+                    const overlapEnd = Math.min(i + 1, total - 1);
+                    const overlapChunks = chunks.slice(overlapStart, overlapEnd + 1);
+                    
+                    if (overlapChunks.length >= 2) {
+                        const overlapParities = GGWaveService.generateParityData(overlapChunks, {
+                            ...fecScheme,
+                            parityCount: 1 // Only primary parity for overlapping groups
+                        });
+                        
+                        for (let p = 0; p < overlapParities.length; p++) {
+                            const parityBase64 = btoa(String.fromCharCode(...overlapParities[p]));
+                            const rangeStr = `${overlapStart + 1}-${overlapEnd + 1}-O${p}`;
+                            const parityPacket = `P:${id}:${rangeStr}:${parityBase64}`;
+                            await this.transmitPacket(parityPacket, protocolName);
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3) END packet
+        const endPacket = `E:${id}::`;
+        onProgress?.({ type: 'end', current: total, total, sessionId: id, packet: endPacket });
+        await this.transmitPacket(endPacket, protocolName);
+    }
+
+    /** Helper to encode+play a packet */
+    private async transmitPacket(packet: string, protocolName: string): Promise<void> {
+        const waveform = await this.textToSound(packet, protocolName);
+        await this.playSound(waveform);
+        
+        // Add extra delay for slower protocols to ensure proper reception
+        let extraDelay = 0;
+        if (protocolName.includes('NORMAL')) {
+            extraDelay = 1000; // 1 second extra delay for normal protocols
+        } else if (protocolName.includes('FAST') && !protocolName.includes('FASTEST')) {
+            extraDelay = 500; // 0.5 second extra delay for fast protocols
+        }
+        
+        if (extraDelay > 0) {
+            console.log(`Adding ${extraDelay}ms delay after packet: ${packet.substring(0, 50)}...`);
+            await new Promise(resolve => setTimeout(resolve, extraDelay));
+        }
+    }
+
+    // ===================== Receiver side =====================
+
+    /** Handle a single received GGWave payload string. Returns full message when reconstructed */
+    private async handleReceivedPacket(
+        raw: string,
+        onProgress?: (progress: {
+            type: 'start' | 'data' | 'parity' | 'end' | 'complete';
+            sessionId: string;
+            packet: string;
+            received: number;
+            total: number;
+            chunks: { [key: number]: boolean };
+            parity: { [key: string]: boolean };
+        }) => void
+    ): Promise<string | null> {
+        const parts = raw.split(':');
+        if (parts.length < 2) return null; // Not a structured packet
+
+        const type = parts[0];
+        const sessionId = parts[1];
+
+        if (!['S', 'D', 'P', 'E'].includes(type)) {
+            return raw; // treat as simple text
+        }
+
+        // Create packet ID for duplicate detection
+        const packetId = `${type}:${sessionId}:${parts[2] || ''}`;
+
+        // Ensure session entry exists when needed
+        const getSession = () => this.receiveSessions.get(sessionId);
+
+        switch (type) {
+            case 'S': {
+                if (parts.length < 5) return null;
+                const expectedHash = parts[3];
+                const total = parseInt(parts[4], 10);
+                const flags = parts[5] || '';
+
+                if (isNaN(total) || !expectedHash) return null;
+
+                // Parse FEC scheme from flags
+                let fecScheme = GGWaveService.DEFAULT_FEC_SCHEME;
+                console.log(`Parsing flags for session ${sessionId}: "${flags}"`);
+                
+                const fecMatch = flags.match(/F([A-Z_0-9]+)/);
+                if (fecMatch) {
+                    const schemeName = fecMatch[1] as keyof typeof GGWaveService.FEC_SCHEMES;
+                    console.log(`Found FEC scheme: ${schemeName}`);
+                    if (GGWaveService.FEC_SCHEMES[schemeName]) {
+                        fecScheme = GGWaveService.FEC_SCHEMES[schemeName];
+                        console.log(`Using FEC scheme: ${fecScheme.name}`);
+                    }
+                } else {
+                    console.log(`No FEC scheme found in flags, using default: ${fecScheme.name}`);
+                }
+
+                // Clean previous if exists
+                if (this.receiveSessions.has(sessionId)) {
+                    clearTimeout(getSession()!.timeoutId);
+                    this.receiveSessions.delete(sessionId);
+                }
+
+                const timeoutMs = GGWaveService.calculateTimeout(total, 'NORMAL'); // Assume slowest protocol for safety
+                console.log(`Session ${sessionId} timeout set to ${timeoutMs}ms for ${total} packets`);
+                const timeoutId = setTimeout(() => {
+                    console.warn(`Session ${sessionId} timed out after ${timeoutMs}ms`);
+                    const session = this.receiveSessions.get(sessionId);
+                    if (session) {
+                        console.log(`Session ${sessionId} incomplete: received ${session.chunks.size}/${session.total} packets`);
+                        console.log('Received packets:', Array.from(session.chunks.keys()).sort((a, b) => a - b));
+                        console.log('Available parity:', Array.from(session.parity.keys()));
+                    }
+                    this.receiveSessions.delete(sessionId);
+                }, timeoutMs);
+
+                this.receiveSessions.set(sessionId, {
+                    total,
+                    expectedHash,
+                    flags,
+                    fecScheme,
+                    chunks: new Map(),
+                    parity: new Map(),
+                    timeoutId,
+                    receivedPackets: new Set([packetId])
+                });
+                
+                // Report progress
+                onProgress?.({
+                    type: 'start',
+                    sessionId,
+                    packet: raw,
+                    received: 0,
+                    total,
+                    chunks: {},
+                    parity: {}
+                });
+                break;
+            }
+            case 'D': {
+                if (parts.length < 4) return null;
+                const seqNum = parseInt(parts[2], 10);
+                const dataBase64 = parts.slice(3).join(':'); // rest of string may contain ':'
+
+                if (isNaN(seqNum)) return null;
+                if (!this.receiveSessions.has(sessionId)) return null;
+                
+                const sess = getSession()!;
+                
+                // Check for duplicate
+                if (sess.receivedPackets.has(packetId)) {
+                    console.log(`Duplicate packet ignored: ${packetId}`);
+                    break;
+                }
+                sess.receivedPackets.add(packetId);
+
+                // Decode Base64 data
+                try {
+                    const dataBytes = Uint8Array.from(atob(dataBase64), c => c.charCodeAt(0));
+                    sess.chunks.set(seqNum, dataBytes);
+                    
+                    // Report progress
+                    const chunksStatus: { [key: number]: boolean } = {};
+                    const parityStatus: { [key: string]: boolean } = {};
+                    
+                    for (let i = 1; i <= sess.total; i++) {
+                        chunksStatus[i] = sess.chunks.has(i);
+                    }
+                    
+                    for (const [key] of sess.parity) {
+                        parityStatus[key] = true;
+                    }
+                    
+                    onProgress?.({
+                        type: 'data',
+                        sessionId,
+                        packet: raw,
+                        received: sess.chunks.size,
+                        total: sess.total,
+                        chunks: chunksStatus,
+                        parity: parityStatus
+                    });
+                } catch (e) {
+                    console.warn(`Invalid Base64 in DATA packet: ${dataBase64}`);
+                    return null;
+                }
+                break;
+            }
+            case 'P': {
+                if (parts.length < 4) return null;
+                const rangeStr = parts[2];
+                const parityBase64 = parts[3];
+                
+                if (!this.receiveSessions.has(sessionId)) return null;
+                
+                const sess = getSession()!;
+                
+                // Check for duplicate
+                if (sess.receivedPackets.has(packetId)) {
+                    console.log(`Duplicate packet ignored: ${packetId}`);
+                    break;
+                }
+                sess.receivedPackets.add(packetId);
+
+                // Decode Base64 parity
+                try {
+                    const parityBytes = Uint8Array.from(atob(parityBase64), c => c.charCodeAt(0));
+                    sess.parity.set(rangeStr, parityBytes);
+                    
+                    // Report progress
+                    const chunksStatus: { [key: number]: boolean } = {};
+                    const parityStatus: { [key: string]: boolean } = {};
+                    
+                    for (let i = 1; i <= sess.total; i++) {
+                        chunksStatus[i] = sess.chunks.has(i);
+                    }
+                    
+                    for (const [key] of sess.parity) {
+                        parityStatus[key] = true;
+                    }
+                    
+                    onProgress?.({
+                        type: 'parity',
+                        sessionId,
+                        packet: raw,
+                        received: sess.chunks.size,
+                        total: sess.total,
+                        chunks: chunksStatus,
+                        parity: parityStatus
+                    });
+                } catch (e) {
+                    console.warn(`Invalid Base64 in PARITY packet: ${parityBase64}`);
+                    return null;
+                }
+                break;
+            }
+            case 'E': {
+                if (!this.receiveSessions.has(sessionId)) return null;
+                const sess = getSession()!;
+                
+                // Check for duplicate
+                if (sess.receivedPackets.has(packetId)) {
+                    console.log(`Duplicate packet ignored: ${packetId}`);
+                    break;
+                }
+                sess.receivedPackets.add(packetId);
+                // Report progress
+                if (sess) {
+                    const chunksStatus: { [key: number]: boolean } = {};
+                    const parityStatus: { [key: string]: boolean } = {};
+                    
+                    for (let i = 1; i <= sess.total; i++) {
+                        chunksStatus[i] = sess.chunks.has(i);
+                    }
+                    
+                    for (const [key] of sess.parity) {
+                        parityStatus[key] = true;
+                    }
+                    
+                    onProgress?.({
+                        type: 'end',
+                        sessionId,
+                        packet: raw,
+                        received: sess.chunks.size,
+                        total: sess.total,
+                        chunks: chunksStatus,
+                        parity: parityStatus
+                    });
+                }
+                break;
+            }
+        }
+
+        // After any packet, attempt to finalize session if possible
+        const sess = this.receiveSessions.get(sessionId);
+        if (!sess) return null;
+        
+        // Log current session state
+        console.log(`Session ${sessionId} state: ${sess.chunks.size}/${sess.total} chunks, ${sess.parity.size} parity packets`);
+        if (sess.chunks.size < sess.total) {
+            const missingChunks = [];
+            for (let i = 1; i <= sess.total; i++) {
+                if (!sess.chunks.has(i)) {
+                    missingChunks.push(i);
+                }
+            }
+            console.log(`Missing chunks: [${missingChunks.join(', ')}]`);
+        }
+
+        // Attempt FEC recovery using the configured scheme
+        if (sess.fecScheme.groupSize > 0) {
+            const totalGroups = Math.ceil(sess.total / sess.fecScheme.groupSize);
+            
+            for (let g = 1; g <= totalGroups; g++) {
+                const startSeq = (g - 1) * sess.fecScheme.groupSize + 1;
+                const endSeq = Math.min(startSeq + sess.fecScheme.groupSize - 1, sess.total);
+                
+                const recovered = GGWaveService.recoverChunks(
+                    sess.chunks, 
+                    sess.parity, 
+                    startSeq, 
+                    sess.fecScheme.groupSize, 
+                    sess.fecScheme
+                );
+                
+                // Apply recovered chunks
+                for (const [index, data] of recovered) {
+                    sess.chunks.set(index, data);
+                    console.log(`FEC recovered packet ${index} for session ${sessionId} using ${sess.fecScheme.name}`);
+                }
+            }
+            
+            // Try overlapping group recovery if enabled
+            if (sess.fecScheme.overlap) {
+                for (let i = sess.fecScheme.groupSize; i < sess.total; i++) {
+                    const overlapStart = i - sess.fecScheme.groupSize + 2;
+                    const overlapEnd = Math.min(i + 1, sess.total);
+                    
+                    if (overlapEnd > overlapStart) {
+                        const recovered = GGWaveService.recoverChunks(
+                            sess.chunks,
+                            sess.parity,
+                            overlapStart,
+                            overlapEnd - overlapStart + 1,
+                            { ...sess.fecScheme, parityCount: 1 }
+                        );
+                        
+                        for (const [index, data] of recovered) {
+                            if (!sess.chunks.has(index)) {
+                                sess.chunks.set(index, data);
+                                console.log(`Overlapping FEC recovered packet ${index} for session ${sessionId}`);
+                            }
+                        }
+                    }
+                }
+            }
+            
+            // Try aggressive recovery: attempt all possible combinations
+            if (sess.chunks.size < sess.total && sess.parity.size > 0) {
+                console.log(`Attempting aggressive recovery for session ${sessionId}`);
+                this.attemptAggressiveRecovery(sess, sessionId);
+            }
+        }
+
+        if (sess.chunks.size === sess.total) {
+            // Reconstruct full message
+            const orderedChunks = Array.from(sess.chunks.entries())
+                .sort((a, b) => a[0] - b[0])
+                .map(entry => entry[1]);
+            
+            // Concatenate all chunks
+            const totalLength = orderedChunks.reduce((sum, chunk) => sum + chunk.length, 0);
+            const fullData = new Uint8Array(totalLength);
+            let offset = 0;
+            
+            for (const chunk of orderedChunks) {
+                fullData.set(chunk, offset);
+                offset += chunk.length;
+            }
+
+            // Verify hash
+            const hashCheck = GGWaveService.md5Base64(fullData);
+            
+            // Cleanup
+            clearTimeout(sess.timeoutId);
+            this.receiveSessions.delete(sessionId);
+
+            if (hashCheck === sess.expectedHash) {
+                try {
+                    // Decompress if needed
+                    let finalData = fullData;
+                    const hasCompressionFlag = sess.flags.includes('C');
+                    
+                    console.log(`Session ${sessionId} flags: "${sess.flags}", hasCompressionFlag: ${hasCompressionFlag}`);
+                    
+                    if (hasCompressionFlag) {
+                        console.log(`Attempting to decompress data for session ${sessionId}`);
+                        finalData = await GGWaveService.decompressData(fullData);
+                        console.log(`Decompression successful for session ${sessionId}`);
+                    } else {
+                        console.log(`No compression flag found, using data as-is for session ${sessionId}`);
+                    }
+                    
+                    // Convert to string
+                    const fullMessage = new TextDecoder().decode(finalData);
+                    console.log(`Message reconstructed successfully for session ${sessionId} (${fullMessage.length} characters)`);
+                    
+                    // Report completion
+                    const chunksStatus: { [key: number]: boolean } = {};
+                    const parityStatus: { [key: string]: boolean } = {};
+                    
+                    for (let i = 1; i <= sess.total; i++) {
+                        chunksStatus[i] = true;
+                    }
+                    
+                    for (const [key] of sess.parity) {
+                        parityStatus[key] = true;
+                    }
+                    
+                    onProgress?.({
+                        type: 'complete',
+                        sessionId,
+                        packet: 'COMPLETE',
+                        received: sess.total,
+                        total: sess.total,
+                        chunks: chunksStatus,
+                        parity: parityStatus
+                    });
+                    
+                    return fullMessage;
+                } catch (e) {
+                    console.error(`Failed to process message for session ${sessionId}:`, e);
+                    
+                    // Fallback: try without decompression
+                    try {
+                        console.log(`Attempting fallback without decompression for session ${sessionId}`);
+                        const fallbackMessage = new TextDecoder().decode(fullData);
+                        console.log(`Fallback successful for session ${sessionId} (${fallbackMessage.length} characters)`);
+                        
+                        // Report completion
+                        const chunksStatus: { [key: number]: boolean } = {};
+                        const parityStatus: { [key: string]: boolean } = {};
+                        
+                        for (let i = 1; i <= sess.total; i++) {
+                            chunksStatus[i] = true;
+                        }
+                        
+                        for (const [key] of sess.parity) {
+                            parityStatus[key] = true;
+                        }
+                        
+                        onProgress?.({
+                            type: 'complete',
+                            sessionId,
+                            packet: 'COMPLETE',
+                            received: sess.total,
+                            total: sess.total,
+                            chunks: chunksStatus,
+                            parity: parityStatus
+                        });
+                        
+                        return fallbackMessage;
+                    } catch (fallbackError) {
+                        console.error(`Fallback also failed for session ${sessionId}:`, fallbackError);
+                        return null;
+                    }
+                }
+            } else {
+                console.warn(`Hash mismatch for session ${sessionId} (expected ${sess.expectedHash}, got ${hashCheck})`);
+            }
+        }
+
+        return null;
+    }
+    
+    // Attempt aggressive recovery using all available parity data
+    private attemptAggressiveRecovery(sess: any, sessionId: string): void {
+        const originalChunkCount = sess.chunks.size;
+        
+        // Try recovery with all parity packets
+        for (const [parityKey, parityData] of sess.parity) {
+            const parts = parityKey.split('-');
+            if (parts.length >= 3) {
+                const startSeq = parseInt(parts[0]);
+                const endSeq = parseInt(parts[1]);
+                const parityType = parts[2];
+                
+                if (!isNaN(startSeq) && !isNaN(endSeq) && startSeq <= endSeq) {
+                    const groupSize = endSeq - startSeq + 1;
+                    
+                    // Count missing packets in this group
+                    const missingInGroup = [];
+                    for (let i = startSeq; i <= endSeq; i++) {
+                        if (!sess.chunks.has(i)) {
+                            missingInGroup.push(i);
+                        }
+                    }
+                    
+                    // Try recovery if we have exactly 1 missing packet and primary parity
+                    if (missingInGroup.length === 1 && parityType === '0') {
+                        const missingIndex = missingInGroup[0];
+                        const recoveredData = parityData.slice();
+                        
+                        // XOR with all present chunks
+                        for (let i = startSeq; i <= endSeq; i++) {
+                            if (sess.chunks.has(i)) {
+                                const chunkData = sess.chunks.get(i);
+                                const paddedChunk = new Uint8Array(GGWaveService.CHUNK_SIZE);
+                                paddedChunk.set(chunkData);
+                                
+                                for (let j = 0; j < GGWaveService.CHUNK_SIZE; j++) {
+                                    recoveredData[j] ^= paddedChunk[j];
+                                }
+                            }
+                        }
+                        
+                        // Remove trailing zeros
+                        let actualLength = recoveredData.length;
+                        while (actualLength > 0 && recoveredData[actualLength - 1] === 0) {
+                            actualLength--;
+                        }
+                        
+                        if (actualLength > 0) {
+                            sess.chunks.set(missingIndex, recoveredData.slice(0, actualLength));
+                            console.log(`Aggressive recovery: recovered packet ${missingIndex} for session ${sessionId}`);
+                        }
+                    }
+                }
+            }
+        }
+        
+        if (sess.chunks.size > originalChunkCount) {
+            console.log(`Aggressive recovery successful: ${sess.chunks.size - originalChunkCount} packets recovered`);
+        }
+    }
 }
