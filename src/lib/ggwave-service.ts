@@ -2,6 +2,14 @@ import ggwaveFactory from 'ggwave';
 import CryptoJS from 'crypto-js';
 import { gunzip, gzip } from 'fflate';
 
+// === SEQUENCIA Parser Types ===
+interface SequenciaInfo {
+    inicio: number;
+    fim: number;
+    tipo: string;
+    isValid: boolean;
+}
+
 export class GGWaveService {
     private ggwave: any;
     private instance: any;
@@ -27,6 +35,69 @@ export class GGWaveService {
     } as const;
     
     public static readonly DEFAULT_FEC_SCHEME = GGWaveService.FEC_SCHEMES.BASIC_3;
+
+    // === SEQUENCIA Parser ===
+    /**
+     * Standardized parser for SEQUENCIA field in parity packets
+     * Handles formats: "1-4", "1-3-0", "2-4-O0"
+     * Always normalizes to include tipo (defaults to "0")
+     * 
+     * Examples:
+     * - parseSequencia("1-4") → {inicio: 1, fim: 4, tipo: "0", isValid: true}
+     * - parseSequencia("1-3-0") → {inicio: 1, fim: 3, tipo: "0", isValid: true}
+     * - parseSequencia("2-4-O0") → {inicio: 2, fim: 4, tipo: "O0", isValid: true}
+     * - parseSequencia("invalid") → {inicio: 0, fim: 0, tipo: "0", isValid: false}
+     */
+    private static parseSequencia(seq: string): SequenciaInfo {
+        const parts = seq.split('-');
+        
+        if (parts.length < 2) {
+            console.warn(`Invalid SEQUENCIA format: ${seq}`);
+            return { inicio: 0, fim: 0, tipo: "0", isValid: false };
+        }
+        
+        const inicio = parseInt(parts[0]);
+        const fim = parseInt(parts[1]);
+        const tipo = parts[2] || "0"; // Default to "0" if not specified
+        
+        const isValid = !isNaN(inicio) && !isNaN(fim) && inicio <= fim && inicio > 0;
+        
+        if (!isValid) {
+            console.warn(`Invalid SEQUENCIA values: inicio=${inicio}, fim=${fim}`);
+        }
+        
+        return { inicio, fim, tipo, isValid };
+    }
+
+    /**
+     * Creates a standardized parity key in the format: inicio-fim-tipo
+     * 
+     * Examples:
+     * - createParityKey(1, 4) → "1-4-0" (default tipo)
+     * - createParityKey(1, 3, "0") → "1-3-0"
+     * - createParityKey(2, 4, "O0") → "2-4-O0"
+     */
+    private static createParityKey(inicio: number, fim: number, tipo: string = "0"): string {
+        return `${inicio}-${fim}-${tipo}`;
+    }
+
+    /**
+     * Normalizes a SEQUENCIA string to always include the tipo field
+     * Ensures consistent key format across the application
+     * 
+     * Examples:
+     * - normalizeSequencia("1-4") → "1-4-0"
+     * - normalizeSequencia("1-3-0") → "1-3-0" (unchanged)
+     * - normalizeSequencia("2-4-O0") → "2-4-O0" (unchanged)
+     * - normalizeSequencia("invalid") → "invalid" (returns original if invalid)
+     */
+    private static normalizeSequencia(seq: string): string {
+        const parsed = GGWaveService.parseSequencia(seq);
+        if (!parsed.isValid) {
+            return seq; // Return original if invalid
+        }
+        return GGWaveService.createParityKey(parsed.inicio, parsed.fim, parsed.tipo);
+    }
 
     // Map of active receive sessions
     private receiveSessions: Map<string, {
@@ -609,8 +680,8 @@ export class GGWaveService {
         }
         
         // Try to recover based on available parity
-        const primaryParityKey = `${groupStart}-${groupEnd}-0`;
-        const secondaryParityKey = `${groupStart}-${groupEnd}-1`;
+        const primaryParityKey = GGWaveService.createParityKey(groupStart, groupEnd, "0");
+        const secondaryParityKey = GGWaveService.createParityKey(groupStart, groupEnd, "1");
         
         // Single error correction with primary parity
         if (missingIndices.length === 1 && parity.has(primaryParityKey)) {
@@ -826,7 +897,7 @@ export class GGWaveService {
                     // Send each parity packet
                     for (let p = 0; p < parities.length; p++) {
                         const parityBase64 = btoa(String.fromCharCode(...parities[p]));
-                        const rangeStr = `${groupStart + 1}-${groupEnd + 1}-${p}`;
+                        const rangeStr = GGWaveService.createParityKey(groupStart + 1, groupEnd + 1, p.toString());
                         const parityPacket = `P:${id}:${rangeStr}:${parityBase64}`;
                         onProgress?.({ 
                             type: 'parity', 
@@ -853,7 +924,7 @@ export class GGWaveService {
                         
                         for (let p = 0; p < overlapParities.length; p++) {
                             const parityBase64 = btoa(String.fromCharCode(...overlapParities[p]));
-                            const rangeStr = `${overlapStart + 1}-${overlapEnd + 1}-O${p}`;
+                            const rangeStr = GGWaveService.createParityKey(overlapStart + 1, overlapEnd + 1, `O${p}`);
                             const parityPacket = `P:${id}:${rangeStr}:${parityBase64}`;
                             await this.transmitPacket(parityPacket, protocolName);
                         }
@@ -1053,7 +1124,9 @@ export class GGWaveService {
                 // Decode Base64 parity
                 try {
                     const parityBytes = Uint8Array.from(atob(parityBase64), c => c.charCodeAt(0));
-                    sess.parity.set(rangeStr, parityBytes);
+                    // Normalize the range string to ensure consistent format
+                    const normalizedRangeStr = GGWaveService.normalizeSequencia(rangeStr);
+                    sess.parity.set(normalizedRangeStr, parityBytes);
                     
                     // Report progress
                     const chunksStatus: { [key: number]: boolean } = {};
@@ -1307,51 +1380,49 @@ export class GGWaveService {
         
         // Try recovery with all parity packets
         for (const [parityKey, parityData] of sess.parity) {
-            const parts = parityKey.split('-');
-            if (parts.length >= 3) {
-                const startSeq = parseInt(parts[0]);
-                const endSeq = parseInt(parts[1]);
-                const parityType = parts[2];
+            const sequenciaInfo = GGWaveService.parseSequencia(parityKey);
+            if (sequenciaInfo.isValid) {
+                const startSeq = sequenciaInfo.inicio;
+                const endSeq = sequenciaInfo.fim;
+                const parityType = sequenciaInfo.tipo;
                 
-                if (!isNaN(startSeq) && !isNaN(endSeq) && startSeq <= endSeq) {
-                    const groupSize = endSeq - startSeq + 1;
+                const groupSize = endSeq - startSeq + 1;
+                
+                // Count missing packets in this group
+                const missingInGroup = [];
+                for (let i = startSeq; i <= endSeq; i++) {
+                    if (!sess.chunks.has(i)) {
+                        missingInGroup.push(i);
+                    }
+                }
+                
+                // Try recovery if we have exactly 1 missing packet and primary parity
+                if (missingInGroup.length === 1 && parityType === '0') {
+                    const missingIndex = missingInGroup[0];
+                    const recoveredData = parityData.slice();
                     
-                    // Count missing packets in this group
-                    const missingInGroup = [];
+                    // XOR with all present chunks
                     for (let i = startSeq; i <= endSeq; i++) {
-                        if (!sess.chunks.has(i)) {
-                            missingInGroup.push(i);
+                        if (sess.chunks.has(i)) {
+                            const chunkData = sess.chunks.get(i);
+                            const paddedChunk = new Uint8Array(GGWaveService.CHUNK_SIZE);
+                            paddedChunk.set(chunkData);
+                            
+                            for (let j = 0; j < GGWaveService.CHUNK_SIZE; j++) {
+                                recoveredData[j] ^= paddedChunk[j];
+                            }
                         }
                     }
                     
-                    // Try recovery if we have exactly 1 missing packet and primary parity
-                    if (missingInGroup.length === 1 && parityType === '0') {
-                        const missingIndex = missingInGroup[0];
-                        const recoveredData = parityData.slice();
-                        
-                        // XOR with all present chunks
-                        for (let i = startSeq; i <= endSeq; i++) {
-                            if (sess.chunks.has(i)) {
-                                const chunkData = sess.chunks.get(i);
-                                const paddedChunk = new Uint8Array(GGWaveService.CHUNK_SIZE);
-                                paddedChunk.set(chunkData);
-                                
-                                for (let j = 0; j < GGWaveService.CHUNK_SIZE; j++) {
-                                    recoveredData[j] ^= paddedChunk[j];
-                                }
-                            }
-                        }
-                        
-                        // Remove trailing zeros
-                        let actualLength = recoveredData.length;
-                        while (actualLength > 0 && recoveredData[actualLength - 1] === 0) {
-                            actualLength--;
-                        }
-                        
-                        if (actualLength > 0) {
-                            sess.chunks.set(missingIndex, recoveredData.slice(0, actualLength));
-                            console.log(`Aggressive recovery: recovered packet ${missingIndex} for session ${sessionId}`);
-                        }
+                    // Remove trailing zeros
+                    let actualLength = recoveredData.length;
+                    while (actualLength > 0 && recoveredData[actualLength - 1] === 0) {
+                        actualLength--;
+                    }
+                    
+                    if (actualLength > 0) {
+                        sess.chunks.set(missingIndex, recoveredData.slice(0, actualLength));
+                        console.log(`Aggressive recovery: recovered packet ${missingIndex} for session ${sessionId}`);
                     }
                 }
             }
