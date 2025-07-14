@@ -119,13 +119,8 @@
     <h1>🔊 SonicWave</h1>
     <p>Transmit and receive text using sound waves with maximum noise tolerance</p>
     
-    <div class="status-bar {isTransmitting ? 'transmitting' : ''}">
+    <div class="status-bar">
         <strong>Status:</strong> {status}
-        {#if isTransmitting}
-            <div class="progress-bar">
-                <div class="progress-fill"></div>
-            </div>
-        {/if}
     </div>
 
     <div class="container">
@@ -168,37 +163,10 @@
                     {availableProtocols.find(p => p.id === selectedProtocol)?.description || 'Select a protocol'}
                 </small>
             </div>
-            
-            <div class="button-group">
-                <button 
-                    on:click={sendText} 
-                    disabled={!isInitialized || !textToSend.trim() || isTransmitting}
-                    class="btn btn-primary {isTransmitting ? 'transmitting' : ''}">
-                    {#if isTransmitting}
-                        <span class="spinner"></span> Transmitting...
-                    {:else}
-                        🎵 Transmit Text
-                    {/if}
-                </button>
-                
-                <button 
-                    on:click={clearTextInput} 
-                    disabled={!textToSend.trim() || isTransmitting}
-                    class="btn btn-secondary">
-                    🗑️ Clear
-                </button>
-            </div>
         </div>
 
         <div class="panel">
             <h2>📥 Receive Text</h2>
-            
-            <button 
-                on:click={startListening} 
-                disabled={!isInitialized || isListening}
-                class="btn btn-secondary">
-                {isListening ? '🎧 Listening...' : '🎧 Start Listening'}
-            </button>
             
             {#if receivedText}
                 <div class="received-text">
@@ -219,6 +187,10 @@
                             <div class="message-time">{message.timestamp.toLocaleTimeString()}</div>
                         </div>
                     {/each}
+                </div>
+            {:else}
+                <div class="no-messages">
+                    <p>No messages received yet. Start listening to capture incoming transmissions.</p>
                 </div>
             {/if}
         </div>
@@ -292,13 +264,55 @@
             <li>Try a short test message like "hi" first</li>
         </ul>
     </div>
+
+    <!-- Fixed Controls at Bottom -->
+    <div class="controls-section">
+        <div class="controls-container">
+            <div class="button-group">
+                <button 
+                    on:click={sendText} 
+                    disabled={!isInitialized || !textToSend.trim() || isTransmitting}
+                    class="btn btn-primary {isTransmitting ? 'transmitting' : ''}">
+                    {#if isTransmitting}
+                        <span class="spinner"></span> Transmitting...
+                    {:else}
+                        🎵 Transmit Text
+                    {/if}
+                </button>
+                
+                <button 
+                    on:click={clearTextInput} 
+                    disabled={!textToSend.trim() || isTransmitting}
+                    class="btn btn-secondary">
+                    🗑️ Clear
+                </button>
+                
+                <button 
+                    on:click={startListening} 
+                    disabled={!isInitialized || isListening}
+                    class="btn btn-secondary">
+                    {isListening ? '🎧 Listening...' : '🎧 Start Listening'}
+                </button>
+            </div>
+            
+            <!-- Progress bar appears below buttons -->
+            {#if isTransmitting}
+                <div class="transmission-progress">
+                    <div class="progress-bar">
+                        <div class="progress-fill"></div>
+                    </div>
+                    <div class="progress-text">{status}</div>
+                </div>
+            {/if}
+        </div>
+    </div>
 </main>
 
 <style>
     main {
         max-width: 1200px;
         margin: 0 auto;
-        padding: 20px;
+        padding: 20px 20px 120px 20px; /* Extra bottom padding for fixed controls */
         font-family: 'Segoe UI', system-ui, sans-serif;
     }
 
@@ -316,14 +330,6 @@
         margin: 20px 0;
         text-align: center;
         font-family: monospace;
-        position: relative;
-        transition: all 0.3s ease;
-    }
-
-    .status-bar.transmitting {
-        background: #e8f5e8;
-        border-color: #27ae60;
-        box-shadow: 0 0 10px rgba(39, 174, 96, 0.3);
     }
 
     .progress-bar {
@@ -490,6 +496,61 @@
         margin-right: 0;
     }
 
+    /* Fixed Controls Section */
+    .controls-section {
+        position: fixed;
+        bottom: 0;
+        left: 0;
+        right: 0;
+        background: white;
+        border-top: 2px solid #e1e5e9;
+        box-shadow: 0 -4px 12px rgba(0, 0, 0, 0.15);
+        z-index: 1000;
+    }
+
+    .controls-container {
+        max-width: 1200px;
+        margin: 0 auto;
+        padding: 15px 20px;
+    }
+
+    .controls-section .button-group {
+        justify-content: center;
+        flex-wrap: wrap;
+        gap: 8px;
+        margin-bottom: 0;
+    }
+
+    .controls-section .btn {
+        flex: 1;
+        min-width: 120px;
+        max-width: 200px;
+        font-size: 14px;
+        padding: 10px 16px;
+    }
+
+    .transmission-progress {
+        margin-top: 12px;
+        text-align: center;
+    }
+
+    .transmission-progress .progress-bar {
+        margin-bottom: 8px;
+    }
+
+    .progress-text {
+        font-size: 12px;
+        color: #27ae60;
+        font-weight: 600;
+    }
+
+    .no-messages {
+        text-align: center;
+        color: #7f8c8d;
+        font-style: italic;
+        padding: 20px;
+    }
+
     .received-text {
         margin-top: 20px;
         padding: 15px;
@@ -588,7 +649,47 @@
         }
         
         main {
-            padding: 15px;
+            padding: 15px 15px 140px 15px; /* More bottom padding on mobile */
+        }
+
+        .controls-section .btn {
+            min-width: 100px;
+            font-size: 13px;
+            padding: 12px 8px;
+        }
+
+        .controls-container {
+            padding: 12px 15px;
+        }
+
+        .panel {
+            padding: 20px;
+        }
+
+        h1 {
+            font-size: 24px;
+        }
+
+        .status-bar {
+            font-size: 14px;
+            padding: 10px;
+        }
+    }
+
+    @media (max-width: 480px) {
+        .controls-section .button-group {
+            flex-direction: column;
+            gap: 8px;
+        }
+
+        .controls-section .btn {
+            width: 100%;
+            max-width: none;
+            min-width: auto;
+        }
+
+        main {
+            padding: 10px 10px 160px 10px;
         }
     }
 </style>
