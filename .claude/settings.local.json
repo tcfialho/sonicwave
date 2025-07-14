@@ -19,7 +19,9 @@
       "Bash(taskkill:*)",
       "Bash(npm run build:*)",
       "Bash(del:*)",
-      "Bash(npm uninstall:*)"
+      "Bash(npm uninstall:*)",
+      "Bash(npm run check:*)",
+      "Bash(node:*)"
     ],
     "deny": []
   }
