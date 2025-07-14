@@ -141,7 +141,56 @@ Cada pacote é uma string com formatos específicos por tipo:
 - **Paridade Secundária (tipo=1)**: XOR ponderado (Reed-Solomon simplificado)
 - **Grupos Overlapping**: Paridade adicional para grupos sobrepostos
 
-#### 6.3.3. Recuperação
+#### 6.3.3. Algoritmo OVERLAPPING_3 - Especificação Determinística
+
+**⚠️ CRÍTICO**: Transmissor e receptor DEVEM usar exatamente o mesmo algoritmo para gerar grupos overlapping.
+
+**Algoritmo Oficial**:
+```
+Para N pacotes usando OVERLAPPING_3:
+
+1. GRUPOS PRINCIPAIS (tipo=0):
+   - Gerar grupos de 3: [1-3], [4-6], [7-9], ...
+   - Para i = 1, 4, 7, 10, ... (i += 3):
+     - Criar grupo [i, min(i+2, N), "0"]
+   - Parar quando i > N
+
+2. GRUPOS OVERLAPPING (tipos O0, O1, O2, ...):
+   - Para i = 2, 3, 4, 5, 6, ... (todos os valores possíveis):
+     - Se i+2 ≤ N: criar grupo [i, i+2, "O{i-2}"]
+   - Parar quando i+2 > N
+
+3. ORDEM DE TRANSMISSÃO:
+   - Todos os grupos principais primeiro (tipos 0)
+   - Todos os grupos overlapping depois (tipos O0, O1, ...)
+```
+
+**Exemplos Determinísticos**:
+
+**6 pacotes**:
+```
+Grupos principais: [1-3-0], [4-6-0]
+Grupos overlapping: [2-4-O0], [3-5-O1], [4-6-O2] (⚠️ 4-6 duplica principal)
+Aplicando filtro: [2-4-O0], [3-5-O1] (remove duplicatas)
+Resultado: P:...:1-3-0, P:...:4-6-0, P:...:2-4-O0, P:...:3-5-O1
+```
+
+**7 pacotes**:
+```
+Grupos principais: [1-3-0], [4-6-0], [7-7-0]
+Grupos overlapping: [2-4-O0], [3-5-O1], [4-6-O2], [5-7-O3]
+Aplicando filtro: [2-4-O0], [3-5-O1], [5-7-O3] (remove 4-6 duplicata)
+Resultado: P:...:1-3-0, P:...:4-6-0, P:...:7-7-0, P:...:2-4-O0, P:...:3-5-O1, P:...:5-7-O3
+```
+
+**8 pacotes**:
+```
+Grupos principais: [1-3-0], [4-6-0], [7-8-0]
+Grupos overlapping: [2-4-O0], [3-5-O1], [4-6-O2], [5-7-O3], [6-8-O4]
+Aplicando filtro: [2-4-O0], [3-5-O1], [5-7-O3], [6-8-O4]
+```
+
+#### 6.3.4. Recuperação
 - **1 Erro**: Usa paridade primária via XOR
 - **2 Erros**: Resolve sistema de equações com paridades primária e secundária
 - **Recuperação Agressiva**: Tenta todas as combinações de paridade disponíveis
@@ -178,12 +227,12 @@ D:1734567890-654321:1:TG9yZW0gaXBzdW0gZG9sb3Igc2l0IGFtZXQsIGNvbnNlY3RldHVyIGFkaX
 D:1734567890-654321:2:cG9yIGluY2lkaWR1bnQgdXQgbGFib3JlIGV0IGRvbG9yZSBtYWduYSBhbGlxdWEuIExvcmVtIGlwc3VtIGRvbG9yIHNpdCBhbWV0
 D:1734567890-654321:3:LCBjb25zZWN0ZXR1ciBhZGlwaXNjaW5nIGVsaXQsIHNlZCBkbyBlaXVzbW9kIHRlbXBvciBpbmNpZGlkdW50IHV0IGxhYm9yZSBl
 D:1734567890-654321:4:dCBkb2xvcmUgbWFnbmEgYWxpcXVhLiBMb3JlbSBpcHN1bSBkb2xvciBzaXQgYW1ldCwgY29uc2VjdGV0dXIgYWRpcGlzY2luZyBl
-P:1734567890-654321:1-4:ZAAHRQZSHR9DFBxHFloNHwMZBw4UCF0jCgZRBFNFUhwHD1QIFV4WWhQFAQJcRxtHV3cABkYDSUNaEBwZABxUDRsGBQUWGkJdGwAZ
+P:1734567890-654321:1-4-0:ZAAHRQZSHR9DFBxHFloNHwMZBw4UCF0jCgZRBFNFUhwHD1QIFV4WWhQFAQJcRxtHV3cABkYDSUNaEBwZABxUDRsGBQUWGkJdGwAZ
 E:1734567890-654321::
 
 ```
 
-**Nota:** Grupo D1-D4 com pacote de paridade P1-4. Se D2 for perdido, pode ser recuperado via: `D2 = D1 XOR D3 XOR D4 XOR P1-4`.
+**Nota:** Grupo D1-D4 com pacote de paridade P1-4-0 (formato padronizado). Se D2 for perdido, pode ser recuperado via: `D2 = D1 XOR D3 XOR D4 XOR P1-4-0`.
 
 ### Exemplo 3: Com Compressão e FEC Avançado
 
@@ -217,13 +266,17 @@ D:1734567890-456789:4:LCBjb25zZWN0ZXR1ciBhZGlwaXNjaW5nIGVsaXQsIHNlZCBkbyBlaXVzbW
 D:1734567890-456789:5:dCBkb2xvcmUgbWFnbmEgYWxpcXVhLiBMb3JlbSBpcHN1bSBkb2xvciBzaXQgYW1ldCwgY29uc2VjdGV0dXIgYWRpcGlzY2luZyBl
 D:1734567890-456789:6:bGl0LCBzZWQgZG8gZWl1c21vZCB0ZW1wb3IgaW5jaWRpZHVudCB1dCBsYWJvcmUgZXQgZG9sb3JlIG1hZ25hIGFsaXF1YS4=
 P:1734567890-456789:1-3-0:ZAAHRQZSHR9DFBxHFloNHwMZBw4UCF0jCgZRBFNFUhwHD1QIFV4WWhQFAQJcRxtHV3cABkYDSUNaEBwZABxUDRsGBQUWGkJdGwAZ
-P:1734567890-456789:2-4-O0:YBBISRTISFNEGByIGGpOIQNaBx5VDG1kDhaSCGOGViwIE2RJGWRXYiRGBRKdSytIW4dBClZETVO7ExyaCCyVESJJBRVXHlOFgAY
 P:1734567890-456789:4-6-0:WAAQDxTDGAdADwNFEwYGBg5TCG0jCgZRBFNFUhwHD1QIFV4WWhQFAQJcRxtHV3cABkYDSUNaEBwZABxUDRsGBQUWGkJdGwAZ
+P:1734567890-456789:2-4-O0:YBBISRTISFNEGByIGGpOIQNaBx5VDG1kDhaSCGOGViwIE2RJGWRXYiRGBRKdSytIW4dBClZETVO7ExyaCCyVESJJBRVXHlOFgAY
 P:1734567890-456789:3-5-O1:XCCJTUSJTGOEGDYJHHRPJRMCCX6WEDH2lEiaTDHPHWixJF3SKGXYijSGCRLE2yuJX5eCDmZFUVO8FyzaDDyWFTKKCRWYIlPGhBZ
 E:1734567890-456789::
 ```
 
-**Nota:** FLAGS=FOVERLAPPING_3 cria grupos sobrepostos: [1-3], [2-4], [4-6], [3-5] com paridades principais (tipo=0) e overlapping (tipo=O0, O1). Permite recuperação robusta mesmo com múltiplas perdas adjacentes.
+**Nota:** FLAGS=FOVERLAPPING_3 segue o algoritmo determinístico corrigido:
+- **Grupos principais**: [1-3-0], [4-6-0] (transmitidos primeiro)
+- **Grupos overlapping**: [2-4-O0], [3-5-O1] (transmitidos depois, filtrados duplicatas)
+- **Ordem de transmissão correta**: P:1-3-0, P:4-6-0, P:2-4-O0, P:3-5-O1
+- **Recuperação**: Múltiplos grupos permitem robustez máxima contra perdas adjacentes
 
 ## 8. Notas de Implementação
 
@@ -244,8 +297,107 @@ E:1734567890-456789::
 10. **Algoritmos de Paridade**: Tipo 0 (XOR simples), Tipo 1 (XOR ponderado), Overlapping (grupos sobrepostos).
 11. **Recuperação**: Tentativa automática com 1 erro (XOR), 2 erros (sistema linear), e recuperação agressiva usando todas as paridades disponíveis.
 12. **Padding FEC**: Chunks menores preenchidos com `\0` até 75 bytes antes do cálculo da paridade, removidos após recuperação.
+13. **Parser SEQUENCIA Padronizado**: Implementação de parser único que normaliza formatos de entrada:
+    - `"1-4"` → normalizado para `"1-4-0"` (tipo padrão)
+    - `"1-3-0"` → mantido como está (formato completo)
+    - `"2-4-O0"` → mantido como está (overlapping)
+    - Validação automática de ranges válidos e tipos suportados
+    - Criação de chaves padronizadas para consistência no Map de paridades
+14. **Algoritmo OVERLAPPING_3 Determinístico**: OBRIGATÓRIO usar o algoritmo especificado:
+    - Grupos principais: `[1-3], [4-6], [7-9], ...` (tipo=0)
+    - Grupos overlapping: `[2-4], [3-5], [5-7], [6-8], ...` (tipos O0, O1, O2, ...)
+    - Ordem fixa: todos principais primeiro, depois todos overlapping
+    - Qualquer desvio causa incompatibilidade total entre transmissor/receptor
+
+### 8.3.4. Implementação do Parser SEQUENCIA
+
+O protocolo implementa um parser padronizado para campos SEQUENCIA em pacotes de paridade, garantindo consistência e robustez:
+
+**Formato Canônico**: `inicio-fim-tipo`
+- `inicio`: Número do primeiro pacote do grupo (≥ 1)
+- `fim`: Número do último pacote do grupo (≥ inicio)
+- `tipo`: Identificador da paridade (`0`, `1`, `O0`, `O1`, etc.)
+
+**Normalização Automática**:
+```
+Entrada: "1-4"     → Saída: "1-4-0"    (tipo padrão)
+Entrada: "1-3-0"   → Saída: "1-3-0"    (inalterado)
+Entrada: "2-4-O0"  → Saída: "2-4-O0"   (overlapping)
+```
+
+**Funções Implementadas**:
+- `parseSequencia(seq)`: Analisa e valida formato de entrada
+- `createParityKey(inicio, fim, tipo)`: Cria chaves padronizadas
+- `normalizeSequencia(seq)`: Normaliza formato para consistência
+
+**Validação**:
+- Verifica se `inicio ≤ fim` e ambos são números válidos
+- Retorna `isValid: false` para formatos inválidos
+- Logs de warning para entradas malformadas
+
+**Compatibilidade Retroativa**:
+- Aceita formatos legados (`"1-4"`) e os normaliza automaticamente
+- Mantém compatibilidade com receptores que usam formato incompleto
+- Transmissores sempre enviam formato completo (`"1-4-0"`)
+- Chaves internas sempre no formato padronizado para consistência
+
+### 8.3.5. Sincronização Crítica do OVERLAPPING_3
+
+**🚨 EXTREMAMENTE IMPORTANTE**: O algoritmo OVERLAPPING_3 é determinístico e DEVE ser implementado exatamente conforme especificado.
+
+**Problema Concreto**:
+Se transmissor e receptor implementarem algoritmos diferentes para gerar grupos overlapping, o receptor não conseguirá usar nenhuma paridade overlapping, resultando em falha total de recuperação.
+
+**Exemplo do Problema**:
+```javascript
+// ❌ IMPLEMENTAÇÃO ERRADA - Transmissor
+function gerarGruposOverlapping_TX(N) {
+    return [[1,3], [2,4], [4,6], [5,7]]; // Algoritmo A
+}
+
+// ❌ IMPLEMENTAÇÃO ERRADA - Receptor  
+function gerarGruposOverlapping_RX(N) {
+    return [[1,3], [3,5], [5,7], [2,4]]; // Algoritmo B
+}
+// RESULTADO: Receptor espera P:...:3-5-O0 mas recebe P:...:2-4-O0 = FALHA
+```
+
+**✅ Implementação Correta**:
+```javascript
+// Ambos transmissor e receptor DEVEM usar o mesmo algoritmo:
+function gerarGruposOverlapping(N) {
+    const grupos = [];
+    const principais = new Set();
+    
+    // 1. Grupos principais primeiro
+    for (let i = 1; i <= N; i += 3) {
+        const grupo = [i, Math.min(i+2, N), "0"];
+        grupos.push(grupo);
+        principais.add(`${grupo[0]}-${grupo[1]}`); // Para evitar duplicatas
+    }
+    
+    // 2. Grupos overlapping depois (remove duplicatas de principais)
+    let oIndex = 0;
+    for (let i = 2; i <= N-2; i++) {
+        if (i+2 <= N) {
+            const key = `${i}-${i+2}`;
+            if (!principais.has(key)) {
+                grupos.push([i, i+2, `O${oIndex}`]);
+            }
+            oIndex++;
+        }
+    }
+    
+    return grupos;
+}
+```
+
+**Verificação de Conformidade**:
+- Para 6 pacotes: `[[1,3,"0"], [4,6,"0"], [2,4,"O0"], [3,5,"O1"]]`
+- Para 7 pacotes: `[[1,3,"0"], [4,6,"0"], [7,7,"0"], [2,4,"O0"], [3,5,"O1"], [5,7,"O3"]]`
+- Para 8 pacotes: `[[1,3,"0"], [4,6,"0"], [7,8,"0"], [2,4,"O0"], [3,5,"O1"], [5,7,"O3"], [6,8,"O4"]]`
 
 ### 8.4. Limites e Extensões
-13. **Extensão do Limite de Sequência**: Para suportar >9.999.999 pacotes, ampliar o campo `SEQUENCIA` e recalcular limites de cabeçalho e chunk.
-14. **Detecção de Duplicatas**: Usando `ID_SESSAO + SEQUENCIA + tipo_pacote` para ignorar retransmissões.
-15. **Limpeza de Sessões**: Remoção automática após timeout com logging detalhado do estado final da sessão.
+15. **Extensão do Limite de Sequência**: Para suportar >9.999.999 pacotes, ampliar o campo `SEQUENCIA` e recalcular limites de cabeçalho e chunk.
+16. **Detecção de Duplicatas**: Usando `ID_SESSAO + SEQUENCIA + tipo_pacote` para ignorar retransmissões.
+17. **Limpeza de Sessões**: Remoção automática após timeout com logging detalhado do estado final da sessão.
