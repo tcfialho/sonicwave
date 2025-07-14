@@ -7,7 +7,7 @@
     let receivedText = '';
     let isInitialized = false;
     let isListening = false;
-    let volume = 60;
+    let volume = 80;
     let selectedProtocol = 'GGWAVE_PROTOCOL_ULTRASONIC_NORMAL';
     let status = 'Ready';
     let receivedMessages: Array<{text: string, timestamp: Date}> = [];
