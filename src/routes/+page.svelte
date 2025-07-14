@@ -17,6 +17,7 @@
     let hasDualTone = false;
     let hasMonoTone = false;
     let isTransmitting = false;
+    let activeTab: 'send' | 'receive' = 'send';
 
     onMount(async () => {
         ggwaveService = new GGWaveService();
@@ -119,78 +120,96 @@
     <h1>🔊 SonicWave</h1>
     <p>Transmit and receive text using sound waves with maximum noise tolerance</p>
     
-    <div class="status-bar">
-        <strong>Status:</strong> {status}
+    <!-- Fixed Status Bar -->
+    <div class="status-bar-fixed">
+        <div class="status-content">
+            <strong>Status:</strong> {status}
+        </div>
     </div>
 
-    <div class="container">
-        <div class="panel">
-            <h2>📤 Send Text</h2>
-            <div class="form-group">
-                <label for="textInput">Text to transmit:</label>
-                <textarea 
-                    id="textInput"
-                    bind:value={textToSend} 
-                    placeholder="Enter text to transmit via sound..."
-                    rows="3"
-                    maxlength="100">
-                </textarea>
-                <small>Maximum 100 characters for reliable transmission</small>
-            </div>
-            
-            <div class="form-group">
-                <label for="volume">Volume: {volume}%</label>
-                <input 
-                    id="volume"
-                    type="range" 
-                    bind:value={volume} 
-                    min="30" 
-                    max="100" 
-                    step="5">
-                <small>Recommended range: 40-80% (ggwave auto-scales internally)</small>
-            </div>
-            
-            <div class="form-group">
-                <label for="protocol">Transmission Mode:</label>
-                <select id="protocol" bind:value={selectedProtocol} class="protocol-select">
-                    {#each availableProtocols as protocol}
-                        <option value={protocol.id}>
-                            {protocol.name}
-                        </option>
-                    {/each}
-                </select>
-                <small class="protocol-description">
-                    {availableProtocols.find(p => p.id === selectedProtocol)?.description || 'Select a protocol'}
-                </small>
-            </div>
+    <!-- Modern Tab Interface -->
+    <div class="tab-container">
+        <div class="tab-header">
+            <button 
+                class="tab-button {activeTab === 'send' ? 'active' : ''}" 
+                on:click={() => activeTab = 'send'}>
+                📤 Send Text
+            </button>
+            <button 
+                class="tab-button {activeTab === 'receive' ? 'active' : ''}" 
+                on:click={() => activeTab = 'receive'}>
+                📥 Receive Text
+            </button>
         </div>
-
-        <div class="panel">
-            <h2>📥 Receive Text</h2>
-            
-            {#if receivedText}
-                <div class="received-text">
-                    <h3>Latest Received:</h3>
-                    <div class="message">{receivedText}</div>
-                </div>
-            {/if}
-            
-            {#if receivedMessages.length > 0}
-                <div class="message-history">
-                    <div class="history-header">
-                        <h3>Message History</h3>
-                        <button on:click={clearReceived} class="btn btn-small">Clear</button>
+        
+        <div class="tab-content">
+            {#if activeTab === 'send'}
+                <div class="panel send-panel">
+                    <div class="form-group">
+                        <label for="textInput">Text to transmit:</label>
+                        <textarea 
+                            id="textInput"
+                            bind:value={textToSend} 
+                            placeholder="Enter text to transmit via sound..."
+                            rows="4"
+                            maxlength="100">
+                        </textarea>
+                        <small>Maximum 100 characters for reliable transmission</small>
                     </div>
-                    {#each receivedMessages as message}
-                        <div class="message-item">
-                            <div class="message-text">{message.text}</div>
-                            <div class="message-time">{message.timestamp.toLocaleTimeString()}</div>
-                        </div>
-                    {/each}
+                    
+                    <div class="form-group">
+                        <label for="volume">Volume: {volume}%</label>
+                        <input 
+                            id="volume"
+                            type="range" 
+                            bind:value={volume} 
+                            min="30" 
+                            max="100" 
+                            step="5">
+                        <small>Recommended range: 40-80% (ggwave auto-scales internally)</small>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label for="protocol">Transmission Mode:</label>
+                        <select id="protocol" bind:value={selectedProtocol} class="protocol-select">
+                            {#each availableProtocols as protocol}
+                                <option value={protocol.id}>
+                                    {protocol.name}
+                                </option>
+                            {/each}
+                        </select>
+                        <small class="protocol-description">
+                            {availableProtocols.find(p => p.id === selectedProtocol)?.description || 'Select a protocol'}
+                        </small>
+                    </div>
                 </div>
             {:else}
-                <div class="no-messages">
-                    <p>No messages received yet. Start listening to capture incoming transmissions.</p>
+                <div class="panel receive-panel">
+                    {#if receivedText}
+                        <div class="received-text">
+                            <h3>Latest Received:</h3>
+                            <div class="message">{receivedText}</div>
+                        </div>
+                    {/if}
+                    
+                    {#if receivedMessages.length > 0}
+                        <div class="message-history">
+                            <div class="history-header">
+                                <h3>Message History</h3>
+                                <button on:click={clearReceived} class="btn btn-small">Clear</button>
+                            </div>
+                            {#each receivedMessages as message}
+                                <div class="message-item">
+                                    <div class="message-text">{message.text}</div>
+                                    <div class="message-time">{message.timestamp.toLocaleTimeString()}</div>
+                                </div>
+                            {/each}
+                        </div>
+                    {:else}
+                        <div class="no-messages">
+                            <p>No messages received yet. Start listening to capture incoming transmissions.</p>
+                        </div>
+                    {/if}
                 </div>
             {/if}
         </div>
@@ -269,30 +288,39 @@
     <div class="controls-section">
         <div class="controls-container">
             <div class="button-group">
-                <button 
-                    on:click={sendText} 
-                    disabled={!isInitialized || !textToSend.trim() || isTransmitting}
-                    class="btn btn-primary {isTransmitting ? 'transmitting' : ''}">
-                    {#if isTransmitting}
-                        <span class="spinner"></span> Transmitting...
-                    {:else}
-                        🎵 Transmit Text
-                    {/if}
-                </button>
-                
-                <button 
-                    on:click={clearTextInput} 
-                    disabled={!textToSend.trim() || isTransmitting}
-                    class="btn btn-secondary">
-                    🗑️ Clear
-                </button>
-                
-                <button 
-                    on:click={startListening} 
-                    disabled={!isInitialized || isListening}
-                    class="btn btn-secondary">
-                    {isListening ? '🎧 Listening...' : '🎧 Start Listening'}
-                </button>
+                {#if activeTab === 'send'}
+                    <button 
+                        on:click={sendText} 
+                        disabled={!isInitialized || !textToSend.trim() || isTransmitting}
+                        class="btn btn-primary {isTransmitting ? 'transmitting' : ''}">
+                        {#if isTransmitting}
+                            <span class="spinner"></span> Transmitting...
+                        {:else}
+                            🎵 Transmit Text
+                        {/if}
+                    </button>
+                    
+                    <button 
+                        on:click={clearTextInput} 
+                        disabled={!textToSend.trim() || isTransmitting}
+                        class="btn btn-secondary">
+                        🗑️ Clear
+                    </button>
+                {:else}
+                    <button 
+                        on:click={startListening} 
+                        disabled={!isInitialized || isListening}
+                        class="btn btn-primary">
+                        {isListening ? '🎧 Listening...' : '🎧 Start Listening'}
+                    </button>
+                    
+                    <button 
+                        on:click={clearReceived} 
+                        disabled={receivedMessages.length === 0}
+                        class="btn btn-secondary">
+                        🗑️ Clear History
+                    </button>
+                {/if}
             </div>
             
             <!-- Progress bar appears below buttons -->
@@ -318,6 +346,7 @@
         max-width: 1200px;
         margin: 0 auto;
         padding: 20px 20px 120px 20px; /* Extra bottom padding for fixed controls */
+        padding-top: 80px; /* Space for fixed status bar */
         font-family: 'Segoe UI', system-ui, sans-serif;
         overflow-x: hidden; /* Prevent horizontal scroll */
     }
@@ -328,14 +357,27 @@
         margin-bottom: 10px;
     }
 
-    .status-bar {
+    /* Fixed Status Bar */
+    .status-bar-fixed {
+        position: fixed;
+        top: 0;
+        left: 0;
+        right: 0;
         background: #f0f8ff;
-        border: 1px solid #4a90e2;
-        border-radius: 8px;
-        padding: 12px;
-        margin: 20px 0;
+        border-bottom: 2px solid #4a90e2;
+        box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+        z-index: 1001;
+        backdrop-filter: blur(10px);
+    }
+    
+    .status-content {
+        max-width: 1200px;
+        margin: 0 auto;
+        padding: 12px 20px;
         text-align: center;
         font-family: monospace;
+        font-size: 14px;
+        color: #2c3e50;
     }
 
     .progress-bar {
@@ -360,32 +402,62 @@
         100% { width: 100%; transform: translateX(100%); }
     }
 
-    .container {
-        display: grid;
-        grid-template-columns: 1fr 1fr;
-        gap: 30px;
-        margin: 30px 0;
-        width: 100%;
-        overflow-x: hidden;
+    /* Tab Container */
+    .tab-container {
+        margin: 20px 0;
+        background: white;
+        border-radius: 12px;
+        box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+        overflow: hidden;
+    }
+    
+    .tab-header {
+        display: flex;
+        background: #f8f9fa;
+        border-bottom: 1px solid #e1e5e9;
+    }
+    
+    .tab-button {
+        flex: 1;
+        background: none;
+        border: none;
+        padding: 16px 20px;
+        font-size: 16px;
+        font-weight: 600;
+        cursor: pointer;
+        transition: all 0.3s;
+        color: #6c757d;
+        border-bottom: 3px solid transparent;
+    }
+    
+    .tab-button:hover {
+        background: #e9ecef;
+        color: #495057;
+    }
+    
+    .tab-button.active {
+        background: white;
+        color: #4a90e2;
+        border-bottom-color: #4a90e2;
+        position: relative;
+    }
+    
+    .tab-content {
+        min-height: 400px;
     }
 
     .panel {
         background: #ffffff;
-        border: 2px solid #e1e5e9;
-        border-radius: 12px;
-        padding: 25px;
-        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        padding: 30px;
         box-sizing: border-box;
         max-width: 100%;
         overflow: hidden;
     }
-
-    .panel h2 {
-        margin-top: 0;
-        color: #2c3e50;
-        border-bottom: 2px solid #ecf0f1;
-        padding-bottom: 10px;
+    
+    .send-panel, .receive-panel {
+        min-height: 350px;
     }
+
 
     .form-group {
         margin-bottom: 20px;
@@ -666,13 +738,9 @@
     }
 
     @media (max-width: 768px) {
-        .container {
-            grid-template-columns: 1fr;
-            gap: 20px;
-        }
-        
         main {
             padding: 15px 15px 140px 15px; /* More bottom padding on mobile */
+            padding-top: 70px; /* Space for fixed status bar on mobile */
         }
 
         .controls-section .btn {
@@ -687,7 +755,16 @@
 
         .panel {
             padding: 20px;
-            margin: 0;
+        }
+        
+        .tab-button {
+            font-size: 14px;
+            padding: 12px 16px;
+        }
+        
+        .status-content {
+            font-size: 12px;
+            padding: 10px 15px;
         }
 
         textarea, .protocol-select {
@@ -719,6 +796,12 @@
 
         main {
             padding: 10px 10px 160px 10px;
+            padding-top: 65px;
+        }
+        
+        .tab-button {
+            font-size: 13px;
+            padding: 10px 12px;
         }
     }
 </style>
