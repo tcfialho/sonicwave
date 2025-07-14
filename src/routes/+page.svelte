@@ -309,11 +309,17 @@
 </main>
 
 <style>
+    /* Global box-sizing fix */
+    *, *::before, *::after {
+        box-sizing: border-box;
+    }
+
     main {
         max-width: 1200px;
         margin: 0 auto;
         padding: 20px 20px 120px 20px; /* Extra bottom padding for fixed controls */
         font-family: 'Segoe UI', system-ui, sans-serif;
+        overflow-x: hidden; /* Prevent horizontal scroll */
     }
 
     h1 {
@@ -359,6 +365,8 @@
         grid-template-columns: 1fr 1fr;
         gap: 30px;
         margin: 30px 0;
+        width: 100%;
+        overflow-x: hidden;
     }
 
     .panel {
@@ -367,6 +375,9 @@
         border-radius: 12px;
         padding: 25px;
         box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        box-sizing: border-box;
+        max-width: 100%;
+        overflow: hidden;
     }
 
     .panel h2 {
@@ -378,6 +389,9 @@
 
     .form-group {
         margin-bottom: 20px;
+        width: 100%;
+        max-width: 100%;
+        box-sizing: border-box;
     }
 
     label {
@@ -389,11 +403,20 @@
 
     textarea, input[type="range"], .protocol-select {
         width: 100%;
+        max-width: 100%;
+        box-sizing: border-box;
         padding: 12px;
         border: 2px solid #bdc3c7;
         border-radius: 6px;
         font-size: 14px;
         transition: border-color 0.3s;
+        resize: vertical; /* Allow only vertical resize */
+    }
+    
+    textarea {
+        overflow-wrap: break-word;
+        word-wrap: break-word;
+        word-break: break-word;
     }
 
     textarea:focus, .protocol-select:focus {
@@ -664,6 +687,12 @@
 
         .panel {
             padding: 20px;
+            margin: 0;
+        }
+
+        textarea, .protocol-select {
+            font-size: 16px; /* Prevent zoom on iOS */
+            padding: 10px;
         }
 
         h1 {
