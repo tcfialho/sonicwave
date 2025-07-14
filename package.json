@@ -21,6 +21,8 @@
 		"vite": "^7.0.4"
 	},
 	"dependencies": {
+		"crypto-js": "^4.2.0",
+		"fflate": "^0.8.2",
 		"ggwave": "^0.4.0"
 	}
 }
