@@ -1,5 +1,4 @@
 import ggwaveFactory from 'ggwave';
-import { AutoDetectCompression } from './text-compression';
 
 export class GGWaveService {
     private ggwave: any;
@@ -21,34 +20,23 @@ export class GGWaveService {
         return new type(buffer);
     }
 
-    // Otimização: Calcula volume adaptativo baseado no protocolo para melhor performance
-    private getOptimizedVolume(userVolume: number, protocolName: string): number {
-        // Protocolos FASTEST precisam de mais volume para compensar menor robustez
-        if (protocolName.includes('FASTEST')) {
-            // Para protocolos mais rápidos, usar volume mais alto (80-100% do valor do usuário)
-            return Math.max(40, Math.min(100, userVolume * 0.9));
-        }
-        
-        // Protocolos FAST precisam de volume médio-alto
-        if (protocolName.includes('FAST') && !protocolName.includes('FASTEST')) {
-            // Volume médio-alto (60-80% do valor do usuário)
-            return Math.max(30, Math.min(80, userVolume * 0.7));
-        }
-        
-        // Protocolos ULTRASONIC precisam de mais volume devido à frequência alta
+    // Volume automático baseado no tipo de protocolo
+    private getAutomaticVolume(protocolName: string): number {
+        // Protocolos ULTRASONIC sempre usam volume máximo (100%)
         if (protocolName.includes('ULTRASONIC') || protocolName.includes('ULTRASOUND')) {
-            // Volume alto para ultrassônico (70-100% do valor do usuário)
-            return Math.max(35, Math.min(100, userVolume * 0.8));
+            console.log(`🔊 Ultrasonic protocol detected - using maximum volume (100%)`);
+            return 100;
         }
         
-        // Protocolos NORMAL (mais robustos) podem usar volume mais conservador
-        if (protocolName.includes('NORMAL')) {
-            // Volume conservador mas efetivo (40-70% do valor do usuário)
-            return Math.max(20, Math.min(70, userVolume * 0.6));
+        // Protocolos AUDIBLE usam volume padrão (80%)
+        if (protocolName.includes('AUDIBLE')) {
+            console.log(`🔊 Audible protocol detected - using standard volume (80%)`);
+            return 80;
         }
         
-        // Fallback para protocolos desconhecidos - comportamento original melhorado
-        return Math.max(15, Math.min(60, userVolume * 0.5));
+        // Outros protocolos (DT, MT, etc.) usam volume médio (80%)
+        console.log(`🔊 Other protocol detected - using standard volume (80%)`);
+        return 80;
     }
 
     private initAudioContext(): void {
@@ -89,18 +77,14 @@ export class GGWaveService {
         }
     }
 
-    async textToSound(text: string, volume: number = 50, protocolName: string = 'GGWAVE_PROTOCOL_ULTRASONIC_FASTEST'): Promise<ArrayBuffer> {
+    async textToSound(text: string, protocolName: string = 'GGWAVE_PROTOCOL_ULTRASONIC_FASTEST'): Promise<ArrayBuffer> {
         if (!this.isInitialized) {
             await this.initialize();
         }
 
         try {
-            // Otimização: Compressão inteligente do texto antes da transmissão
-            const compressionResult = AutoDetectCompression.compress(text);
-            const textToEncode = compressionResult.result;
-            
-            console.log(`📝 Text compression: ${text.length} → ${textToEncode.length} chars (${compressionResult.savings} saved, method: ${compressionResult.method})`);
-            console.log(`🔮 Prediction: ${compressionResult.prediction}`);
+            // Usar texto diretamente sem compressão
+            const textToEncode = text;
             
             // Get the protocol ID from the protocol name
             let protocolId = this.ggwave.ProtocolId[protocolName];
@@ -129,12 +113,15 @@ export class GGWaveService {
                 }
             }
             
-            // Otimização: Volume adaptativo baseado no protocolo para melhor performance
-            const adjustedVolume = this.getOptimizedVolume(volume, protocolName);
+            // Volume automático baseado no tipo de protocolo
+            const automaticVolume = this.getAutomaticVolume(protocolName);
+            
+            // Encode text to UTF-8 bytes for transmission
+            const textBytes = new TextEncoder().encode(textToEncode);
             
             // Generate audio waveform like in the official example
-            const waveform = this.ggwave.encode(this.instance, textToEncode, protocolId, adjustedVolume);
-            console.log(`🎵 Encoded "${textToEncode}" using protocol ${protocolName} with volume ${adjustedVolume}`);
+            const waveform = this.ggwave.encode(this.instance, textBytes, protocolId, automaticVolume);
+            console.log(`🎵 Encoded "${textToEncode}" using protocol ${protocolName} with automatic volume ${automaticVolume}%`);
             return waveform;
         } catch (error) {
             console.error('Failed to encode text to sound:', error);
@@ -173,7 +160,7 @@ export class GGWaveService {
         }
     }
 
-    async startListening(callback: (text: string, wasDecompressed?: boolean) => void): Promise<void> {
+    async startListening(callback: (text: string) => void): Promise<void> {
         if (!this.isInitialized) {
             await this.initialize();
         }
@@ -228,19 +215,27 @@ export class GGWaveService {
                     );
 
                     if (result && result.length > 0) {
-                        // Decode the result as UTF-8 text like in the official example
-                        const decodedText = new TextDecoder("utf-8").decode(result);
-                        
-                        // Otimização: Descompressão automática do texto recebido
-                        const finalText = AutoDetectCompression.decompress(decodedText);
-                        const wasDecompressed = finalText !== decodedText;
-                        
-                        console.log('📥 Received message:', decodedText);
-                        if (wasDecompressed) {
-                            console.log('🔍 Decompressed to:', finalText);
+                        try {
+                            // Try UTF-8 decoding first (standard approach)
+                            const decodedText = new TextDecoder("utf-8").decode(result);
+                            
+                            console.log('📥 Received message:', decodedText);
+                            callback(decodedText);
+                        } catch (utfError) {
+                            // Fallback: Try Latin-1 decoding for non-UTF8 data
+                            try {
+                                const decodedText = new TextDecoder("latin1").decode(result);
+                                
+                                console.log('📥 Received message (latin1):', decodedText);
+                                callback(decodedText);
+                            } catch (latinError) {
+                                // Final fallback: Convert raw bytes to string
+                                const rawString = Array.from(result, byte => String.fromCharCode(byte)).join('');
+                                
+                                console.log('📥 Received message (raw):', rawString);
+                                callback(rawString);
+                            }
                         }
-                        
-                        callback(finalText, wasDecompressed);
                     }
                 } catch (error) {
                     // Silently ignore decode errors (expected for non-ggwave audio)
@@ -472,23 +467,4 @@ export class GGWaveService {
         return availableProtocols;
     }
 
-    // Métodos utilitários para compressão
-    testCompression(text: string): {
-        original: string,
-        compressed: string, 
-        decompressed: string,
-        success: boolean,
-        savings: string,
-        method: string
-    } {
-        return AutoDetectCompression.testAutoDetection(text);
-    }
-
-    getCompressionStats(): { size: number, entries: Array<{text: string, method: string, ratio: number}> } {
-        return AutoDetectCompression.getCacheStats();
-    }
-
-    clearCompressionCache(): void {
-        AutoDetectCompression.clearCache();
-    }
 }
