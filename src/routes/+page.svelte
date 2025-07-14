@@ -70,7 +70,7 @@
             
             const protocolName = availableProtocols.find(p => p.id === selectedProtocol)?.name || selectedProtocol;
             status = `✅ Transmitted: "${messageToSend}" using ${protocolName}`;
-            textToSend = ''; // Clear text automatically after transmission
+            // textToSend = ''; // Clear text automatically after transmission
         } catch (error) {
             status = `❌ Transmission failed: ${error}`;
         } finally {
@@ -231,8 +231,22 @@
 
     <!-- Help Modal -->
     {#if showHelpModal}
-        <div class="modal-overlay" on:click={() => showHelpModal = false}>
-            <div class="modal-content" on:click={(e) => e.stopPropagation()}>
+        <div
+            class="modal-overlay"
+            role="button"
+            tabindex="0"
+            on:click={(e) => {
+                if (e.currentTarget === e.target) {
+                    showHelpModal = false;
+                }
+            }}
+            on:keydown={(e) => {
+                if (e.currentTarget === e.target && (e.key === 'Enter' || e.key === ' ')) {
+                    showHelpModal = false;
+                }
+            }}
+        >
+            <div class="modal-content" role="dialog" aria-modal="true">
                 <div class="modal-header">
                     <h3>ℹ️ GGWave Protocol Guide</h3>
                     <button class="modal-close" on:click={() => showHelpModal = false}>✕</button>
@@ -815,13 +829,6 @@
         max-height: calc(80vh - 80px);
     }
 
-    .info-panel ul {
-        padding-left: 20px;
-    }
-
-    .info-panel li {
-        margin-bottom: 5px;
-    }
     
     .protocol-info {
         background: #f8f9fa;
@@ -891,10 +898,6 @@
             font-size: 24px;
         }
 
-        .status-bar {
-            font-size: 14px;
-            padding: 10px;
-        }
     }
 
     @media (max-width: 480px) {
