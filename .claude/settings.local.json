@@ -16,7 +16,8 @@
       "Bash(git push:*)",
       "Bash(rmdir:*)",
       "Bash(rm:*)",
-      "Bash(taskkill:*)"
+      "Bash(taskkill:*)",
+      "Bash(npm run build:*)"
     ],
     "deny": []
   }
