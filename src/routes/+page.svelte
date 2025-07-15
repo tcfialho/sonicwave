@@ -9,17 +9,38 @@
     let isListening = false;
     let selectedProtocol = 'GGWAVE_PROTOCOL_ULTRASONIC_FASTEST';
     let useCompression = false;
-    let selectedFecScheme = 'BASIC_3';
+    let selectedFecScheme = 'OVERLAPPING_3';
     let status = 'Ready';
-    let receivedMessages: Array<{text: string, timestamp: Date}> = [];
+    let receivedMessages: Array<{
+        text: string, 
+        timestamp: Date, 
+        isFile?: boolean, 
+        filename?: string, 
+        fileSize?: string, 
+        batchId?: string
+    }> = [];
     let availableProtocols: Array<{id: string, name: string, description: string}> = [];
     let hasAudible = false;
     let hasUltrasonic = false;
     let hasDualTone = false;
     let hasMonoTone = false;
     let isTransmitting = false;
-    let activeTab: 'send' | 'receive' = 'send';
+    let activeTab: 'send' | 'files' | 'receive' = 'send';
     let showHelpModal = false;
+    
+    // File transfer
+    let selectedFiles: FileList | null = null;
+    let isTransmittingFiles = false;
+    let fileTransferProgress = {
+        type: 'idle' as 'idle' | 'zip-creation' | 'transmitting',
+        filename: '',
+        originalSize: 0,
+        compressedSize: 0,
+        compressionRatio: 0,
+        current: 0,
+        total: 0
+    };
+    let receivedBatches: any[] = [];
     
     // Progress tracking
     let transmissionProgress = {
@@ -51,6 +72,7 @@
         ggwaveService = new GGWaveService();
         try {
             await ggwaveService.initialize();
+            await ggwaveService.initializeFileService();
             isInitialized = true;
             availableProtocols = ggwaveService.getAvailableProtocols();
             
@@ -152,14 +174,35 @@
             status = 'Listening for transmissions...';
             
             await ggwaveService.startListening((text: string) => {
-                const message = {
-                    text: text,
-                    timestamp: new Date()
-                };
-                receivedMessages = [message, ...receivedMessages];
-                receivedText = text;
+                // Check if this is a FILE packet being returned as text (means it was processed by handleFilePacket)
+                if (text.startsWith('📦 File batch received:')) {
+                    // This is already processed by handleFilePacket and onFileTransferProgress
+                    // Don't add it again to receivedMessages
+                    console.log('File packet detected in text callback - already processed by file transfer callback');
+                    return;
+                }
                 
-                status = `📥 Message received (${text.length} characters)`;
+                // Check if this starts with "FILE:" which means it's a raw file packet
+                if (text.startsWith('FILE:')) {
+                    // This should have been handled by handleFilePacket
+                    // If it appears here, it means file processing failed
+                    console.log('Raw FILE packet detected in text callback - file processing may have failed:', text.substring(0, 100) + '...');
+                    
+                    // Don't add to receivedMessages here - let onFileTransferProgress handle it
+                    // If file processing truly failed, the error callback will handle it
+                    status = `📦 Processing file...`;
+                    return;
+                } else {
+                    // Regular text message
+                    const message = {
+                        text: text,
+                        timestamp: new Date(),
+                        isFile: false
+                    };
+                    receivedMessages = [message, ...receivedMessages];
+                    receivedText = text;
+                    status = `📥 Text message received (${text.length} characters)`;
+                }
                 
                 // Reset reception progress
                 receptionProgress.phase = 'idle';
@@ -245,6 +288,165 @@
         }
     }
 
+    // File transfer functions
+    function onFileSelect(event: Event) {
+        const input = event.target as HTMLInputElement;
+        selectedFiles = input.files;
+        if (selectedFiles && selectedFiles.length > 0) {
+            status = `📂 Selected ${selectedFiles.length} file(s) for transmission`;
+        }
+    }
+
+    async function sendFiles() {
+        if (!isInitialized || !selectedFiles || selectedFiles.length === 0 || isTransmittingFiles) return;
+        
+        isTransmittingFiles = true;
+        fileTransferProgress.type = 'idle';
+        
+        try {
+            const fecScheme = (ggwaveService.constructor as any).FEC_SCHEMES[selectedFecScheme] || (ggwaveService.constructor as any).DEFAULT_FEC_SCHEME;
+            
+            await ggwaveService.sendFiles(
+                selectedFiles,
+                selectedProtocol,
+                fecScheme,
+                (progress) => {
+                    if (progress.type === 'zip-creation') {
+                        fileTransferProgress.type = 'zip-creation';
+                        if (progress.zipInfo) {
+                            fileTransferProgress.filename = progress.zipInfo.filename;
+                            fileTransferProgress.originalSize = progress.zipInfo.originalSize;
+                            fileTransferProgress.compressedSize = progress.zipInfo.compressedSize;
+                            fileTransferProgress.compressionRatio = progress.zipInfo.compressionRatio;
+                            status = `📦 Creating ZIP: ${progress.zipInfo.filename} (${progress.zipInfo.compressionRatio.toFixed(1)}% compression)`;
+                        }
+                    } else {
+                        fileTransferProgress.type = 'transmitting';
+                        fileTransferProgress.current = progress.current;
+                        fileTransferProgress.total = progress.total;
+                        
+                        if (progress.type === 'start') {
+                            status = `📡 Starting file transmission: ${fileTransferProgress.filename}`;
+                        } else if (progress.type === 'data') {
+                            const percentage = ((progress.current / progress.total) * 100).toFixed(1);
+                            status = `📡 Transmitting: ${progress.current}/${progress.total} chunks (${percentage}%)`;
+                        } else if (progress.type === 'parity') {
+                            status = `🔧 Sending error correction data: ${progress.current}/${progress.total}`;
+                        } else if (progress.type === 'end') {
+                            status = `✅ File transmission completed: ${fileTransferProgress.filename}`;
+                        }
+                    }
+                }
+            );
+            
+            status = `✅ Files sent successfully`;
+            
+            // Clear selection
+            selectedFiles = null;
+            const fileInput = document.getElementById('fileInput') as HTMLInputElement;
+            if (fileInput) fileInput.value = '';
+            
+        } catch (error) {
+            status = `❌ Error sending files: ${error}`;
+            console.error('File send error:', error);
+        } finally {
+            isTransmittingFiles = false;
+            fileTransferProgress.type = 'idle';
+        }
+    }
+
+    async function loadReceivedBatches() {
+        try {
+            receivedBatches = await ggwaveService.getReceivedBatches();
+        } catch (error) {
+            console.error('Error loading received batches:', error);
+        }
+    }
+
+    async function extractBatch(batchId: string) {
+        try {
+            status = `📂 Extracting files from batch...`;
+            const files = await ggwaveService.extractBatch(batchId);
+            status = `✅ Extracted ${files.length} files successfully`;
+            await loadReceivedBatches(); // Refresh list
+        } catch (error) {
+            status = `❌ Error extracting batch: ${error}`;
+            console.error('Extract error:', error);
+        }
+    }
+
+    async function downloadFile(batchId: string, filename: string) {
+        try {
+            await ggwaveService.downloadFile(batchId, filename);
+            status = `📥 Downloaded: ${filename}`;
+        } catch (error) {
+            status = `❌ Error downloading file: ${error}`;
+            console.error('Download error:', error);
+        }
+    }
+
+    async function downloadBatch(batchId: string) {
+        try {
+            await ggwaveService.downloadBatch(batchId);
+            status = `📥 Downloaded batch as ZIP`;
+        } catch (error) {
+            status = `❌ Error downloading batch: ${error}`;
+            console.error('Download batch error:', error);
+        }
+    }
+
+    async function deleteBatch(batchId: string) {
+        try {
+            await ggwaveService.deleteBatch(batchId);
+            status = `🗑️ Deleted batch`;
+            await loadReceivedBatches(); // Refresh list
+        } catch (error) {
+            status = `❌ Error deleting batch: ${error}`;
+            console.error('Delete error:', error);
+        }
+    }
+
+    // Set up file transfer progress listener
+    onMount(() => {
+        if (ggwaveService) {
+            ggwaveService.onFileTransferProgress((progress) => {
+                console.log('File transfer progress:', progress);
+                // Update UI based on file transfer progress
+                if (progress.status === 'complete') {
+                    console.log('File transfer complete, adding to received messages:', progress);
+                    
+                    // Check if this file is already in receivedMessages to avoid duplicates
+                    const existingIndex = receivedMessages.findIndex(msg => 
+                        msg.isFile && msg.batchId === progress.batchId
+                    );
+                    
+                    const fileMessage = {
+                        text: `📦 File batch received: ${progress.filename} (${(progress.totalSize / 1024).toFixed(1)} KB)`,
+                        timestamp: new Date(),
+                        isFile: true,
+                        filename: progress.filename,
+                        fileSize: `${(progress.totalSize / 1024).toFixed(1)} KB`,
+                        batchId: progress.batchId
+                    };
+                    
+                    if (existingIndex >= 0) {
+                        // Update existing entry
+                        receivedMessages[existingIndex] = fileMessage;
+                        receivedMessages = [...receivedMessages]; // Trigger reactivity
+                    } else {
+                        // Add new entry
+                        receivedMessages = [fileMessage, ...receivedMessages];
+                    }
+                    
+                    status = `📦 File received: ${progress.filename}`;
+                    loadReceivedBatches(); // Refresh received batches
+                } else if (progress.status === 'failed') {
+                    status = `❌ File transfer failed: ${progress.error || 'Unknown error'}`;
+                }
+            });
+        }
+    });
+
 
 </script>
 
@@ -271,9 +473,14 @@
                 📤 Send Text
             </button>
             <button 
+                class="tab-button {activeTab === 'files' ? 'active' : ''}" 
+                on:click={() => activeTab = 'files'}>
+                📤 Send Files
+            </button>
+            <button 
                 class="tab-button {activeTab === 'receive' ? 'active' : ''}" 
                 on:click={handleReceiveTabClick}>
-                📥 Receive Text
+                📥 Receive
             </button>
         </div>
         
@@ -317,29 +524,20 @@
                     <div class="form-group">
                         <label for="fecScheme">Error Correction (FEC):</label>
                         <select id="fecScheme" bind:value={selectedFecScheme} class="protocol-select">
-                            <option value="NONE">None - No error correction</option>
-                            <option value="BASIC_2">Basic 2+1 - Can recover 1 lost packet per 2</option>
-                            <option value="BASIC_3">Basic 3+1 - Can recover 1 lost packet per 3 (default)</option>
-                            <option value="BASIC_4">Basic 4+1 - Can recover 1 lost packet per 4</option>
-                            <option value="ENHANCED_2">Enhanced 2+2 - Can recover 2 lost packets per 2</option>
-                            <option value="ENHANCED_3">Enhanced 3+2 - Can recover 2 lost packets per 3</option>
-                            <option value="OVERLAPPING_3">Overlapping 3+1 - Extra redundancy with overlapping groups</option>
+                            <option value="NONE">No protection (0% overhead)</option>
+                            <option value="BASIC_4">Simple protection 4:1 (25% overhead)</option>
+                            <option value="BASIC_2">Simple protection 2:1 (50% overhead)</option>
+                            <option value="OVERLAPPING_3">Enhanced overlapping protection (67% overhead)</option>
                         </select>
                         <small class="fec-description">
                             {#if selectedFecScheme === 'NONE'}
-                                No error correction - fastest but no protection against packet loss
-                            {:else if selectedFecScheme === 'BASIC_2'}
-                                Groups of 2 data packets + 1 parity packet. Can recover if 1 packet is lost.
-                            {:else if selectedFecScheme === 'BASIC_3'}
-                                Groups of 3 data packets + 1 parity packet. Can recover if 1 packet is lost.
+                                📈 Very reliable channel / performance testing - Maximum speed, zero complexity
                             {:else if selectedFecScheme === 'BASIC_4'}
-                                Groups of 4 data packets + 1 parity packet. Can recover if 1 packet is lost.
-                            {:else if selectedFecScheme === 'ENHANCED_2'}
-                                Groups of 2 data packets + 2 parity packets. Can recover if up to 2 packets are lost.
-                            {:else if selectedFecScheme === 'ENHANCED_3'}
-                                Groups of 3 data packets + 2 parity packets. Can recover if up to 2 packets are lost.
+                                🛡️ Simple protection - isolated error acceptable - Keeps 75% payload; 1 error per group
+                            {:else if selectedFecScheme === 'BASIC_2'}
+                                🛡️🛡️ Simple protection - slightly worse channel - Handles loss of up to 33% in group (1/2)
                             {:else if selectedFecScheme === 'OVERLAPPING_3'}
-                                Overlapping groups provide extra redundancy for better recovery in noisy environments.
+                                🛡️🛡️🛡️ Enhanced protection without inflating overhead - Tolerates burst of up to 4 consecutive packets, covering each data twice
                             {/if}
                         </small>
                     </div>
@@ -382,6 +580,59 @@
                             </div>
                         </div>
                     {/if}
+                </div>
+            {:else if activeTab === 'files'}
+                <div class="panel files-panel">
+                    <div class="form-group">
+                        <label for="fileInput">Select files to send:</label>
+                        <input 
+                            type="file" 
+                            id="fileInput"
+                            multiple 
+                            on:change={onFileSelect}
+                            disabled={!isInitialized || isTransmittingFiles}
+                            class="file-input"
+                        />
+                        {#if selectedFiles && selectedFiles.length > 0}
+                            <div class="file-preview">
+                                <h4>Selected files ({selectedFiles.length}):</h4>
+                                <ul class="file-list">
+                                    {#each Array.from(selectedFiles) as file}
+                                        <li class="file-item">
+                                            📄 {file.name} ({(file.size / 1024).toFixed(1)} KB)
+                                        </li>
+                                    {/each}
+                                </ul>
+                                <p class="send-instruction">Use the "📤 Send Files as ZIP" button below to transmit these files.</p>
+                            </div>
+                        {/if}
+                    </div>
+
+                    <!-- File Transfer Progress -->
+                    {#if fileTransferProgress.type !== 'idle'}
+                        <div class="progress-section">
+                            <h4>📦 File Transfer Progress</h4>
+                            {#if fileTransferProgress.type === 'zip-creation'}
+                                <div class="progress-info">
+                                    <p>Creating ZIP: {fileTransferProgress.filename}</p>
+                                    <p>Original: {(fileTransferProgress.originalSize / 1024).toFixed(1)} KB → Compressed: {(fileTransferProgress.compressedSize / 1024).toFixed(1)} KB</p>
+                                    <p>Compression: {fileTransferProgress.compressionRatio.toFixed(1)}%</p>
+                                </div>
+                            {:else if fileTransferProgress.type === 'transmitting'}
+                                <div class="progress-info">
+                                    <p>Transmitting: {fileTransferProgress.filename}</p>
+                                    <div class="progress-bar">
+                                        <div 
+                                            class="progress-fill" 
+                                            style="width: {((fileTransferProgress.current / fileTransferProgress.total) * 100).toFixed(1)}%"
+                                        ></div>
+                                    </div>
+                                    <p>Progress: {fileTransferProgress.current}/{fileTransferProgress.total} chunks ({((fileTransferProgress.current / fileTransferProgress.total) * 100).toFixed(1)}%)</p>
+                                </div>
+                            {/if}
+                        </div>
+                    {/if}
+
                 </div>
             {:else}
                 <div class="panel receive-panel">
@@ -462,24 +713,40 @@
                     {#if receivedMessages.length > 0}
                         <div class="message-history">
                             <div class="history-header">
-                                <h3>Message History</h3>
+                                <h3>📥 Received Items</h3>
                                 <button on:click={clearReceived} class="btn btn-small">Clear</button>
                             </div>
                             {#each receivedMessages as message}
                                 <div class="message-item">
                                     <div class="message-content">
-                                        <div class="message-text">{message.text}</div>
+                                        {#if message.isFile}
+                                            <div class="file-received">
+                                                <div class="file-icon">📦</div>
+                                                <div class="file-info">
+                                                    <div class="file-name">{message.filename}</div>
+                                                    <div class="file-size">{message.fileSize}</div>
+                                                </div>
+                                            </div>
+                                        {:else}
+                                            <div class="message-text">{message.text}</div>
+                                        {/if}
                                         <div class="message-time">{message.timestamp.toLocaleTimeString()}</div>
                                     </div>
-                                    <button on:click={() => copyToClipboard(message.text)} class="btn btn-small copy-btn-small">
-                                        📋
-                                    </button>
+                                    {#if message.isFile}
+                                        <button class="btn btn-small download-btn" on:click={() => downloadBatch(message.batchId)}>
+                                            📥 Download
+                                        </button>
+                                    {:else}
+                                        <button on:click={() => copyToClipboard(message.text)} class="btn btn-small copy-btn-small">
+                                            📋
+                                        </button>
+                                    {/if}
                                 </div>
                             {/each}
                         </div>
                     {:else if receptionProgress.phase === 'idle'}
                         <div class="no-messages">
-                            <p>No messages received yet. Start listening to capture incoming transmissions.</p>
+                            <p>No items received yet. Start listening to capture incoming transmissions (text or files).</p>
                         </div>
                     {/if}
                 </div>
@@ -602,6 +869,18 @@
                         disabled={!textToSend.trim() || isTransmitting}
                         class="btn btn-secondary">
                         🗑️ Clear
+                    </button>
+                {:else if activeTab === 'files'}
+                    <button 
+                        class="btn btn-primary send-btn"
+                        on:click={sendFiles}
+                        disabled={!isInitialized || !selectedFiles || selectedFiles.length === 0 || isTransmittingFiles}
+                    >
+                        {#if isTransmittingFiles}
+                            🔄 Sending Files...
+                        {:else}
+                            📤 Send Files as ZIP
+                        {/if}
                     </button>
                 {:else}
                     <button 
@@ -1290,6 +1569,51 @@
         background: #138496;
     }
 
+    .download-btn {
+        background: #28a745;
+        color: white;
+    }
+
+    .download-btn:hover:not(:disabled) {
+        background: #218838;
+    }
+
+    .file-received {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+    }
+
+    .file-icon {
+        font-size: 24px;
+    }
+
+    .file-info {
+        flex: 1;
+    }
+
+    .file-name {
+        font-weight: 600;
+        color: #495057;
+        margin-bottom: 2px;
+    }
+
+    .file-size {
+        font-size: 12px;
+        color: #6c757d;
+    }
+
+    .send-instruction {
+        margin-top: 10px;
+        padding: 8px 12px;
+        background: #e3f2fd;
+        border: 1px solid #bbdefb;
+        border-radius: 4px;
+        font-size: 14px;
+        color: #1976d2;
+        text-align: center;
+    }
+
 
     .btn-help {
         background: #6c757d;
@@ -1473,6 +1797,170 @@
             font-size: 9px;
         }
 
+    }
+
+    /* Received Files Section Styles */
+    .received-files-section {
+        margin-top: 30px;
+        padding-top: 20px;
+        border-top: 2px solid #e9ecef;
+    }
+
+    .received-files-section .section-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-bottom: 15px;
+    }
+
+    .received-files-section h3 {
+        margin: 0;
+        color: #495057;
+        font-size: 18px;
+    }
+
+    .no-files {
+        text-align: center;
+        color: #7f8c8d;
+        font-style: italic;
+        padding: 20px;
+        background: #f8f9fa;
+        border-radius: 8px;
+        border: 1px solid #e9ecef;
+    }
+
+    .batches-list {
+        display: flex;
+        flex-direction: column;
+        gap: 15px;
+    }
+
+    .batch-item {
+        background: #f8f9fa;
+        border: 1px solid #e9ecef;
+        border-radius: 8px;
+        padding: 15px;
+        transition: box-shadow 0.2s;
+    }
+
+    .batch-item:hover {
+        box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+    }
+
+    .batch-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: flex-start;
+        gap: 15px;
+    }
+
+    .batch-info {
+        flex: 1;
+        min-width: 0;
+    }
+
+    .batch-info h5 {
+        margin: 0 0 5px 0;
+        font-size: 16px;
+        color: #495057;
+    }
+
+    .batch-meta {
+        margin: 0;
+        font-size: 12px;
+        color: #6c757d;
+    }
+
+    .batch-actions {
+        display: flex;
+        gap: 8px;
+        flex-wrap: wrap;
+        align-items: center;
+    }
+
+    .btn-tiny {
+        padding: 3px 8px;
+        font-size: 10px;
+        border-radius: 3px;
+        background: #17a2b8;
+        color: white;
+        border: none;
+        cursor: pointer;
+        transition: background 0.3s;
+    }
+
+    .btn-tiny:hover {
+        background: #138496;
+    }
+
+    .btn-danger {
+        background: #dc3545;
+        color: white;
+    }
+
+    .btn-danger:hover:not(:disabled) {
+        background: #c82333;
+    }
+
+    .extracted-badge {
+        background: #28a745;
+        color: white;
+        padding: 4px 8px;
+        border-radius: 4px;
+        font-size: 10px;
+        font-weight: 600;
+    }
+
+    .extracted-files {
+        margin-top: 15px;
+        padding: 10px;
+        background: white;
+        border-radius: 6px;
+        border: 1px solid #dee2e6;
+    }
+
+    .extracted-files h6 {
+        margin: 0 0 10px 0;
+        font-size: 14px;
+        color: #495057;
+    }
+
+    .extracted-files-list {
+        list-style: none;
+        padding: 0;
+        margin: 0;
+    }
+
+    .extracted-file-item {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        padding: 8px 0;
+        border-bottom: 1px solid #f1f3f4;
+        font-size: 13px;
+        color: #495057;
+    }
+
+    .extracted-file-item:last-child {
+        border-bottom: none;
+    }
+
+    @media (max-width: 768px) {
+        .batch-header {
+            flex-direction: column;
+            align-items: stretch;
+            gap: 10px;
+        }
+
+        .batch-actions {
+            justify-content: flex-start;
+        }
+
+        .extracted-file-item {
+            flex-direction: column;
+            align-items: flex-start;
+            gap: 5px;
+        }
     }
 
     @media (max-width: 480px) {
