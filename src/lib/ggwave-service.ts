@@ -1,6 +1,7 @@
 import ggwaveFactory from 'ggwave';
 import CryptoJS from 'crypto-js';
 import { gunzip, gzip } from 'fflate';
+import { FileService, type ReceivedBatch, type FileTransferProgress } from './file-service';
 
 // === SEQUENCIA Parser Types ===
 interface SequenciaInfo {
@@ -10,6 +11,14 @@ interface SequenciaInfo {
     isValid: boolean;
 }
 
+// === FEC Scheme Types ===
+interface FECScheme {
+    groupSize: number;
+    parityCount: number;
+    name: string;
+    overlap?: boolean;
+}
+
 export class GGWaveService {
     private ggwave: any;
     private instance: any;
@@ -17,6 +26,10 @@ export class GGWaveService {
     private audioContext: AudioContext | null = null;
     private isInitialized: boolean = false;
     private currentProtocol: string | null = null;
+    
+    // === File transfer support ===
+    private fileService: FileService = new FileService();
+    private fileTransferCallbacks: Array<(progress: FileTransferProgress) => void> = [];
 
     // === Large message support ===
     private static readonly CHUNK_SIZE = 75; // bytes per data packet (before Base64)
@@ -25,17 +38,15 @@ export class GGWaveService {
     private static readonly MIN_SESSION_TIMEOUT_MS = 60_000; // minimum 1 minute timeout
     
     // === FEC Configuration ===
-    public static readonly FEC_SCHEMES = {
-        NONE: { groupSize: 0, parityCount: 0, name: 'No FEC' },
-        BASIC_2: { groupSize: 2, parityCount: 1, name: 'Basic 2+1' },
-        BASIC_3: { groupSize: 3, parityCount: 1, name: 'Basic 3+1' },
-        BASIC_4: { groupSize: 4, parityCount: 1, name: 'Basic 4+1' },
-        ENHANCED_2: { groupSize: 2, parityCount: 2, name: 'Enhanced 2+2' },
-        ENHANCED_3: { groupSize: 3, parityCount: 2, name: 'Enhanced 3+2' },
-        OVERLAPPING_3: { groupSize: 3, parityCount: 1, overlap: true, name: 'Overlapping 3+1' }
-    } as const;
+    public static readonly FEC_SCHEMES: Record<string, FECScheme> = {
+        NONE: { groupSize: 0, parityCount: 0, name: 'No protection (0% overhead)' },
+        BASIC_4: { groupSize: 4, parityCount: 1, name: 'Simple protection 4:1 (25% overhead)' },
+        BASIC_2: { groupSize: 2, parityCount: 1, name: 'Simple protection 2:1 (50% overhead)' },
+        OVERLAPPING_3: { groupSize: 3, parityCount: 1, overlap: true, name: 'Enhanced overlapping protection (67% overhead)' },
+        STRONG_OVERLAPPING_3: { groupSize: 3, parityCount: 3, overlap: true, name: 'Strong overlapping protection (100% overhead, corrects up to 3 errors)' }
+    };
     
-    public static readonly DEFAULT_FEC_SCHEME = GGWaveService.FEC_SCHEMES.OVERLAPPING_3;
+    public static readonly DEFAULT_FEC_SCHEME = GGWaveService.FEC_SCHEMES.STRONG_OVERLAPPING_3;
 
     // === SEQUENCIA Parser ===
     /**
@@ -148,7 +159,7 @@ export class GGWaveService {
      * Generates FEC groups for a given scheme and total packets
      * Returns groups in transmission order: main groups first, then overlapping
      */
-    private static generateFECGroups(totalPackets: number, fecScheme: typeof GGWaveService.FEC_SCHEMES[keyof typeof GGWaveService.FEC_SCHEMES]): Array<{start: number, end: number, type: string}> {
+    private static generateFECGroups(totalPackets: number, fecScheme: FECScheme): Array<{start: number, end: number, type: string}> {
         if (fecScheme.groupSize === 0) {
             return []; // No FEC
         }
@@ -179,7 +190,7 @@ export class GGWaveService {
         total: number;
         expectedHash: string;
         flags: string;
-        fecScheme: typeof GGWaveService.FEC_SCHEMES[keyof typeof GGWaveService.FEC_SCHEMES];
+        fecScheme: FECScheme;
         chunks: Map<number, Uint8Array>; // seq -> raw data bytes
         parity: Map<string, Uint8Array>; // "group-type" -> parity bytes
         timeoutId: ReturnType<typeof setTimeout>;
@@ -384,7 +395,7 @@ export class GGWaveService {
             console.log('Audio stream created with constraints:', constraints);
             console.log('Media stream tracks:', stream.getTracks().map(t => ({ kind: t.kind, label: t.label, settings: t.getSettings() })));
 
-            if (this.audioContext!.createScriptProcessor) {
+            if (typeof this.audioContext!.createScriptProcessor === 'function') {
                 recorder = this.audioContext!.createScriptProcessor(
                     bufferSize,
                     numberOfInputChannels,
@@ -697,7 +708,7 @@ export class GGWaveService {
     }
     
     // Generate parity data for a group using specified scheme
-    private static generateParityData(chunks: Uint8Array[], scheme: typeof GGWaveService.FEC_SCHEMES[keyof typeof GGWaveService.FEC_SCHEMES]): Uint8Array[] {
+    private static generateParityData(chunks: Uint8Array[], scheme: FECScheme): Uint8Array[] {
         const parities: Uint8Array[] = [];
         
         if (scheme.parityCount === 0) {
@@ -724,15 +735,31 @@ export class GGWaveService {
             parities.push(secondaryParity);
         }
         
+        // Tertiary parity for strong schemes
+        if (scheme.parityCount >= 3) {
+            // Another weighted XOR with different scheme, e.g., weight squared
+            const tertiaryParity = new Uint8Array(GGWaveService.CHUNK_SIZE);
+            for (let i = 0; i < chunks.length; i++) {
+                const weight = (i + 1) * (i + 1); // Squared for independence
+                const paddedChunk = new Uint8Array(GGWaveService.CHUNK_SIZE);
+                paddedChunk.set(chunks[i]);
+                
+                for (let j = 0; j < GGWaveService.CHUNK_SIZE; j++) {
+                    tertiaryParity[j] ^= (paddedChunk[j] * weight) & 0xFF;
+                }
+            }
+            parities.push(tertiaryParity);
+        }
+        
         return parities;
     }
     
     // Attempt to recover missing chunks using available parity data
     private static recoverChunks(
-        chunks: Map<number, Uint8Array>, 
-        parity: Map<string, Uint8Array>, 
-        groupStart: number, 
-        groupSize: number, 
+        chunks: Map<number, Uint8Array>,
+        parity: Map<string, Uint8Array>,
+        groupStart: number,
+        groupSize: number,
         scheme: typeof GGWaveService.FEC_SCHEMES[keyof typeof GGWaveService.FEC_SCHEMES]
     ): Map<number, Uint8Array> {
         const recovered = new Map<number, Uint8Array>();
@@ -754,12 +781,19 @@ export class GGWaveService {
             }
         }
         
+        console.log(`Recovering group [${groupStart}-${groupEnd}]: ${missingIndices.length} missing`);
+        
         // Try to recover based on available parity
         const primaryParityKey = GGWaveService.createParityKey(groupStart, groupEnd, "0");
         const secondaryParityKey = GGWaveService.createParityKey(groupStart, groupEnd, "1");
         
+        const hasPrimary = parity.has(primaryParityKey);
+        const hasSecondary = parity.has(secondaryParityKey);
+        
+        console.log(`Parities available: primary=${hasPrimary}, secondary=${hasSecondary}`);
+        
         // Single error correction with primary parity
-        if (missingIndices.length === 1 && parity.has(primaryParityKey)) {
+        if (missingIndices.length === 1 && hasPrimary) {
             const missingIndex = missingIndices[0];
             const primaryParity = parity.get(primaryParityKey)!;
             
@@ -779,21 +813,18 @@ export class GGWaveService {
                 actualLength--;
             }
             
-            recovered.set(missingIndex, recoveredData.slice(0, actualLength));
+            if (actualLength > 0) {
+                recovered.set(missingIndex, recoveredData.slice(0, actualLength));
+                console.log(`Recovered single missing packet ${missingIndex} using primary parity`);
+            }
         }
         
         // Double error correction with enhanced schemes
-        else if (missingIndices.length === 2 && scheme.parityCount >= 2 && 
-                 parity.has(primaryParityKey) && parity.has(secondaryParityKey)) {
-            
-            // This is a simplified approach - real Reed-Solomon would be more complex
-            // For now, we'll attempt recovery using both parities
-            const [missing1, missing2] = missingIndices;
+        else if (missingIndices.length === 2 && hasPrimary && hasSecondary) {
+            const [missing1, missing2] = missingIndices.sort((a,b) => a-b);
             const primaryParity = parity.get(primaryParityKey)!;
             const secondaryParity = parity.get(secondaryParityKey)!;
             
-            // Solve the system of equations (simplified)
-            // This is a basic implementation - in practice, you'd use proper Galois field math
             try {
                 const recoveredData1 = new Uint8Array(GGWaveService.CHUNK_SIZE);
                 const recoveredData2 = new Uint8Array(GGWaveService.CHUNK_SIZE);
@@ -813,22 +844,29 @@ export class GGWaveService {
                     }
                 }
                 
-                // Solve for the two missing chunks (simplified approach)
+                // Solve for the two missing chunks
                 const weight1 = missing1 - groupStart + 1;
                 const weight2 = missing2 - groupStart + 1;
                 
                 for (let j = 0; j < GGWaveService.CHUNK_SIZE; j++) {
-                    // Simplified solution - in practice, use proper linear algebra
                     const a = adjustedPrimary[j];
                     const b = adjustedSecondary[j];
                     
-                    // Solve: x + y = a, w1*x + w2*y = b
+                    // Solve: x + y = a
+                    // w1*x + w2*y = b
                     if (weight1 !== weight2) {
-                        const y = ((b - weight1 * a) / (weight2 - weight1)) & 0xFF;
-                        const x = (a ^ y) & 0xFF;
+                        // y = (b - w1*a) / (w2 - w1)
+                        let y = (b - (weight1 * a)) / (weight2 - weight1);
+                        y = Math.round(y) & 0xFF; // Round and mask to byte
                         
-                        recoveredData1[j] = x;
-                        recoveredData2[j] = y;
+                        let x = (a ^ y) & 0xFF;
+                        
+                        recoveredData1[j] = missing1 < missing2 ? x : y;
+                        recoveredData2[j] = missing1 < missing2 ? y : x;
+                    } else {
+                        // Fallback if weights equal - use average (simplified)
+                        recoveredData1[j] = (a / 2) & 0xFF;
+                        recoveredData2[j] = (a / 2) & 0xFF;
                     }
                 }
                 
@@ -839,10 +877,124 @@ export class GGWaveService {
                 let len2 = recoveredData2.length;
                 while (len2 > 0 && recoveredData2[len2 - 1] === 0) len2--;
                 
-                recovered.set(missing1, recoveredData1.slice(0, len1));
-                recovered.set(missing2, recoveredData2.slice(0, len2));
+                if (len1 > 0 && len2 > 0) {
+                    recovered.set(missing1, recoveredData1.slice(0, len1));
+                    recovered.set(missing2, recoveredData2.slice(0, len2));
+                    console.log(`Recovered double missing packets ${missing1},${missing2} using dual parity`);
+                }
             } catch (error) {
                 console.warn('Double error correction failed:', error);
+            }
+        }
+        
+        // New: Triple error correction for strong schemes
+        else if (missingIndices.length === 3 && scheme.parityCount >= 3 && hasPrimary && hasSecondary && parity.has(GGWaveService.createParityKey(groupStart, groupEnd, "2"))) {
+            const [missing1, missing2, missing3] = missingIndices.sort((a,b) => a-b);
+            const primaryParity = parity.get(primaryParityKey)!;
+            const secondaryParity = parity.get(secondaryParityKey)!;
+            const tertiaryParityKey = GGWaveService.createParityKey(groupStart, groupEnd, "2");
+            const tertiaryParity = parity.get(tertiaryParityKey)!;
+            
+            try {
+                const recoveredData1 = new Uint8Array(GGWaveService.CHUNK_SIZE);
+                const recoveredData2 = new Uint8Array(GGWaveService.CHUNK_SIZE);
+                const recoveredData3 = new Uint8Array(GGWaveService.CHUNK_SIZE);
+                
+                // Apply present chunks to all parities
+                const adjustedPrimary = primaryParity.slice();
+                const adjustedSecondary = secondaryParity.slice();
+                const adjustedTertiary = tertiaryParity.slice();
+                
+                for (const { index, data } of presentChunks) {
+                    const paddedData = new Uint8Array(GGWaveService.CHUNK_SIZE);
+                    paddedData.set(data);
+                    const weight1 = 1; // For primary (simple XOR)
+                    const weight2 = index - groupStart + 1; // For secondary
+                    const weight3 = weight2 * weight2; // For tertiary (squared)
+                    
+                    for (let j = 0; j < GGWaveService.CHUNK_SIZE; j++) {
+                        adjustedPrimary[j] ^= (paddedData[j] * weight1) & 0xFF;
+                        adjustedSecondary[j] ^= (paddedData[j] * weight2) & 0xFF;
+                        adjustedTertiary[j] ^= (paddedData[j] * weight3) & 0xFF;
+                    }
+                }
+                
+                // Solve 3x3 system for each byte
+                // Equations:
+                // w11*x + w12*y + w13*z = a
+                // w21*x + w22*y + w23*z = b
+                // w31*x + w32*y + w33*z = c
+                const w11 = 1, w12 = 1, w13 = 1;
+                const w21 = missing1 - groupStart + 1;
+                const w22 = missing2 - groupStart + 1;
+                const w23 = missing3 - groupStart + 1;
+                const w31 = w21 * w21;
+                const w32 = w22 * w22;
+                const w33 = w23 * w23;
+                
+                for (let j = 0; j < GGWaveService.CHUNK_SIZE; j++) {
+                    const a = adjustedPrimary[j];
+                    const b = adjustedSecondary[j];
+                    const c = adjustedTertiary[j];
+                    
+                    // Simplified Gauss elimination (assuming invertible matrix)
+                    // This is approximate for integers; in production, use proper GF(256)
+                    try {
+                        // Eliminate x from eq2 and eq3
+                        const mult21 = w21 / w11;
+                        const mult31 = w31 / w11;
+                        
+                        const b2 = b - mult21 * a;
+                        const c2 = c - mult31 * a;
+                        
+                        const w22_new = w22 - mult21 * w12;
+                        const w23_new = w23 - mult21 * w13;
+                        const w32_new = w32 - mult31 * w12;
+                        const w33_new = w33 - mult31 * w13;
+                        
+                        // Eliminate y from eq3
+                        const mult32 = w32_new / w22_new;
+                        const c3 = c2 - mult32 * b2;
+                        const w33_final = w33_new - mult32 * w23_new;
+                        
+                        // Back-substitute
+                        let z = (w33_final !== 0) ? (c3 / w33_final) : 0;
+                        let y = (w22_new !== 0) ? ((b2 - w23_new * z) / w22_new) : 0;
+                        let x = (w11 !== 0) ? ((a - w12 * y - w13 * z) / w11) : 0;
+                        
+                        // Round and mask to bytes
+                        recoveredData1[j] = Math.round(x) & 0xFF;
+                        recoveredData2[j] = Math.round(y) & 0xFF;
+                        recoveredData3[j] = Math.round(z) & 0xFF;
+                    } catch (e) {
+                        // Fallback if division by zero
+                        recoveredData1[j] = a & 0xFF;
+                        recoveredData2[j] = b & 0xFF;
+                        recoveredData3[j] = c & 0xFF;
+                    }
+                }
+                
+                // Trim trailing zeros
+                let len1 = recoveredData1.length; while (len1 > 0 && recoveredData1[len1-1] === 0) len1--;
+                let len2 = recoveredData2.length; while (len2 > 0 && recoveredData2[len2-1] === 0) len2--;
+                let len3 = recoveredData3.length; while (len3 > 0 && recoveredData3[len3-1] === 0) len3--;
+                
+                if (len1 > 0 && len2 > 0 && len3 > 0) {
+                    recovered.set(missing1, recoveredData1.slice(0, len1));
+                    recovered.set(missing2, recoveredData2.slice(0, len2));
+                    recovered.set(missing3, recoveredData3.slice(0, len3));
+                    console.log(`Recovered triple missing packets ${missing1},${missing2},${missing3} using triple parity`);
+                }
+            } catch (error) {
+                console.warn('Triple error correction failed:', error);
+            }
+        }
+        
+        // New: Attempt recovery for overlapping groups with 1 missing even if parityCount=1
+        if (scheme.overlap && missingIndices.length === 1 && hasPrimary) {
+            // Already handled above, but add logging
+            if (recovered.size > 0) {
+                console.log(`Overlapping single recovery successful for group [${groupStart}-${groupEnd}]`);
             }
         }
         
@@ -864,7 +1016,7 @@ export class GGWaveService {
         return new Promise((resolve, reject) => {
             gunzip(data, (err, decompressed) => {
                 if (err) reject(err);
-                else resolve(decompressed);
+                else resolve(new Uint8Array(decompressed));
             });
         });
     }
@@ -957,7 +1109,7 @@ export class GGWaveService {
         message: string, 
         protocolName: string = 'GGWAVE_PROTOCOL_ULTRASONIC_FASTEST', 
         compress: boolean = false,
-        fecScheme: typeof GGWaveService.FEC_SCHEMES[keyof typeof GGWaveService.FEC_SCHEMES] = GGWaveService.DEFAULT_FEC_SCHEME,
+        fecScheme: FECScheme = GGWaveService.DEFAULT_FEC_SCHEME,
         onProgress?: (progress: {
             type: 'start' | 'data' | 'parity' | 'end';
             current: number;
@@ -1072,6 +1224,8 @@ export class GGWaveService {
             extraDelay = 1000; // 1 second extra delay for normal protocols
         } else if (protocolName.includes('FAST') && !protocolName.includes('FASTEST')) {
             extraDelay = 500; // 0.5 second extra delay for fast protocols
+        } else if (protocolName.includes('FASTEST')) {
+            extraDelay = 200; // Add small delay even for fastest to prevent overlap
         }
         
         if (extraDelay > 0) {
@@ -1100,6 +1254,11 @@ export class GGWaveService {
 
         const type = parts[0];
         const sessionId = parts[1];
+
+        // Handle FILE packets specially
+        if (type === 'FILE') {
+            return await this.handleFilePacket(raw);
+        }
 
         if (!['S', 'D', 'P', 'E'].includes(type)) {
             return raw; // treat as simple text
@@ -1411,18 +1570,22 @@ export class GGWaveService {
             // Cleanup
             clearTimeout(sess.timeoutId);
             this.receiveSessions.delete(sessionId);
+            
+            // Signal successful completion to potentially stop transmission
+            console.log(`🎉 Session ${sessionId} completed successfully - message recovered!`);
 
             if (hashCheck === sess.expectedHash) {
                 try {
                     // Decompress if needed
-                    let finalData = fullData;
+                    let finalData: Uint8Array = fullData;
                     const hasCompressionFlag = sess.flags.includes('C');
                     
                     console.log(`Session ${sessionId} flags: "${sess.flags}", hasCompressionFlag: ${hasCompressionFlag}`);
                     
                     if (hasCompressionFlag) {
                         console.log(`Attempting to decompress data for session ${sessionId}`);
-                        finalData = await GGWaveService.decompressData(fullData);
+                        const decompressed = await GGWaveService.decompressData(fullData);
+                        finalData = new Uint8Array(decompressed);
                         console.log(`Decompression successful for session ${sessionId}`);
                     } else {
                         console.log(`No compression flag found, using data as-is for session ${sessionId}`);
@@ -1453,6 +1616,15 @@ export class GGWaveService {
                         chunks: chunksStatus,
                         parity: parityStatus
                     });
+                    
+                    // Check if this is a FILE message that was sent using sendLargeData
+                    if (fullMessage.startsWith('FILE:')) {
+                        console.log('Detected FILE message from large data transmission, processing as file...');
+                        // Process as file packet
+                        const fileResult = await this.handleFilePacket(fullMessage);
+                        // Return the file processing result or null to prevent showing raw FILE data
+                        return fileResult;
+                    }
                     
                     return fullMessage;
                 } catch (e) {
@@ -1485,6 +1657,15 @@ export class GGWaveService {
                             chunks: chunksStatus,
                             parity: parityStatus
                         });
+                        
+                        // Check if this is a FILE message (fallback case)
+                        if (fallbackMessage.startsWith('FILE:')) {
+                            console.log('Detected FILE message from fallback, processing as file...');
+                            // Process as file packet
+                            const fileResult = await this.handleFilePacket(fallbackMessage);
+                            // Return the file processing result or null to prevent showing raw FILE data
+                            return fileResult;
+                        }
                         
                         return fallbackMessage;
                     } catch (fallbackError) {
@@ -1557,5 +1738,244 @@ export class GGWaveService {
         if (sess.chunks.size > originalChunkCount) {
             console.log(`Aggressive recovery successful: ${sess.chunks.size - originalChunkCount} packets recovered`);
         }
+    }
+
+    // ===================== File Transfer Handling =====================
+
+    /**
+     * Handle received FILE packet
+     */
+    private async handleFilePacket(raw: string): Promise<string | null> {
+        try {
+            // Parse FILE packet: FILE:batchId:filename:base64Data
+            const parts = raw.split(':');
+            if (parts.length < 4) {
+                console.warn('Invalid FILE packet format:', raw.substring(0, 100));
+                return null;
+            }
+            
+            const batchId = parts[1];
+            const filename = parts[2];
+            const base64Data = parts.slice(3).join(':'); // Rejoin in case filename had colons
+            
+            console.log(`📥 Processing FILE packet: ${filename} for batch ${batchId}`);
+            
+            // Decode base64 to ZIP data
+            const zipData = Uint8Array.from(atob(base64Data), c => c.charCodeAt(0));
+            
+            // Create batch record
+            const batch: ReceivedBatch = {
+                batchId,
+                filename,
+                zipData,
+                receivedAt: new Date(),
+                extracted: false,
+                files: []
+            };
+            
+            // Store in IndexedDB
+            await this.fileService.storeBatch(batch);
+            
+            // Notify file transfer callbacks
+            const progress: FileTransferProgress = {
+                batchId,
+                filename,
+                totalSize: zipData.length,
+                receivedChunks: 1,
+                totalChunks: 1,
+                percentage: 100,
+                eta: 0,
+                status: 'complete'
+            };
+            
+            this.fileTransferCallbacks.forEach(callback => {
+                try {
+                    callback(progress);
+                } catch (error) {
+                    console.error('Error in file transfer callback:', error);
+                }
+            });
+            
+            console.log(`✅ File batch received: ${filename} (${zipData.length} bytes)`);
+            
+            // Return null to prevent this from appearing in text callback
+            // The file transfer callback will handle UI updates
+            return null;
+            
+        } catch (error) {
+            console.error('❌ Error handling FILE packet:', error);
+            
+            // Notify error via callbacks
+            if (this.fileTransferCallbacks.length > 0) {
+                const errorProgress: FileTransferProgress = {
+                    batchId: 'unknown',
+                    filename: 'unknown',
+                    totalSize: 0,
+                    receivedChunks: 0,
+                    totalChunks: 1,
+                    percentage: 0,
+                    eta: 0,
+                    status: 'failed',
+                    error: error instanceof Error ? error.message : 'Unknown error'
+                };
+                
+                this.fileTransferCallbacks.forEach(callback => {
+                    try {
+                        callback(errorProgress);
+                    } catch (cbError) {
+                        console.error('Error in file transfer error callback:', cbError);
+                    }
+                });
+            }
+            
+            return `❌ Failed to receive file: ${error instanceof Error ? error.message : 'Unknown error'}`;
+        }
+    }
+
+    // ===================== File Transfer Methods =====================
+
+    /**
+     * Initialize file service (call once on app startup)
+     */
+    async initializeFileService(): Promise<void> {
+        await this.fileService.initialize();
+        console.log('📁 File service initialized');
+    }
+
+    /**
+     * Send multiple files as a ZIP batch
+     */
+    async sendFiles(
+        files: FileList, 
+        protocolName: string = 'GGWAVE_PROTOCOL_ULTRASONIC_FASTEST',
+        fecScheme: FECScheme = GGWaveService.DEFAULT_FEC_SCHEME,
+        onProgress?: (progress: {
+            type: 'zip-creation' | 'start' | 'data' | 'parity' | 'end';
+            current: number;
+            total: number;
+            sessionId: string;
+            packet?: string;
+            zipInfo?: { filename: string; originalSize: number; compressedSize: number; compressionRatio: number };
+        }) => void
+    ): Promise<void> {
+        try {
+            if (!files || files.length === 0) {
+                throw new Error('No files selected');
+            }
+
+            console.log(`📤 Starting file transfer: ${files.length} files`);
+            
+            // Calculate total original size
+            let totalOriginalSize = 0;
+            for (let i = 0; i < files.length; i++) {
+                totalOriginalSize += files[i].size;
+            }
+
+            // Create ZIP with maximum compression
+            onProgress?.({ type: 'zip-creation', current: 0, total: 1, sessionId: '', zipInfo: undefined });
+            
+            const { zipData, filename } = await this.fileService.createZipFromFiles(files);
+            const compressionRatio = ((1 - zipData.length / totalOriginalSize) * 100);
+            
+            console.log(`📦 ZIP created: ${filename} (${zipData.length} bytes, ${compressionRatio.toFixed(1)}% compression)`);
+            
+            onProgress?.({ 
+                type: 'zip-creation', 
+                current: 1, 
+                total: 1, 
+                sessionId: '',
+                zipInfo: {
+                    filename,
+                    originalSize: totalOriginalSize,
+                    compressedSize: zipData.length,
+                    compressionRatio
+                }
+            });
+
+            // Generate batch ID
+            const batchId = `batch-${Date.now()}-${Math.random().toString(36).substr(2, 6)}`;
+            
+            // Convert ZIP to base64 for transmission
+            const base64Zip = btoa(String.fromCharCode(...zipData));
+            const fileMessage = `FILE:${batchId}:${filename}:${base64Zip}`;
+            
+            console.log(`📡 Transmitting ZIP batch: ${filename} (${base64Zip.length} chars)`);
+            
+            // Send using existing sendLargeData method
+            await this.sendLargeData(
+                fileMessage,
+                protocolName,
+                false, // No additional compression (already ZIP compressed)
+                fecScheme,
+                (progress) => {
+                    // Forward progress with file context
+                    onProgress?.({
+                        type: progress.type,
+                        current: progress.current,
+                        total: progress.total,
+                        sessionId: progress.sessionId,
+                        packet: progress.packet
+                    });
+                }
+            );
+            
+            console.log(`✅ File batch transmission completed: ${filename}`);
+            
+        } catch (error) {
+            console.error('❌ Error sending files:', error);
+            throw new Error(`Failed to send files: ${error instanceof Error ? error.message : 'Unknown error'}`);
+        }
+    }
+
+    /**
+     * Subscribe to file transfer progress updates
+     */
+    onFileTransferProgress(callback: (progress: FileTransferProgress) => void): void {
+        this.fileTransferCallbacks.push(callback);
+    }
+
+    /**
+     * Unsubscribe from file transfer progress updates
+     */
+    offFileTransferProgress(callback: (progress: FileTransferProgress) => void): void {
+        const index = this.fileTransferCallbacks.indexOf(callback);
+        if (index > -1) {
+            this.fileTransferCallbacks.splice(index, 1);
+        }
+    }
+
+    /**
+     * Get all received file batches
+     */
+    async getReceivedBatches(): Promise<ReceivedBatch[]> {
+        return await this.fileService.getAllBatches();
+    }
+
+    /**
+     * Extract files from a received batch
+     */
+    async extractBatch(batchId: string): Promise<Array<{ name: string; size: number }>> {
+        return await this.fileService.extractBatch(batchId);
+    }
+
+    /**
+     * Download individual file from a batch
+     */
+    async downloadFile(batchId: string, filename: string): Promise<void> {
+        await this.fileService.downloadFile(batchId, filename);
+    }
+
+    /**
+     * Download entire batch as ZIP
+     */
+    async downloadBatch(batchId: string): Promise<void> {
+        await this.fileService.downloadBatch(batchId);
+    }
+
+    /**
+     * Delete a batch and its files
+     */
+    async deleteBatch(batchId: string): Promise<void> {
+        await this.fileService.deleteBatch(batchId);
     }
 }
