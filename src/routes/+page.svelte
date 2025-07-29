@@ -9,7 +9,6 @@
     let isListening = false;
     let selectedProtocol = 'GGWAVE_PROTOCOL_ULTRASONIC_FASTEST';
     let useCompression = false;
-    let selectedFecScheme = 'OVERLAPPING_3';
     let status = 'Ready';
     let receivedMessages: Array<{
         text: string, 
@@ -25,7 +24,7 @@
     let hasDualTone = false;
     let hasMonoTone = false;
     let isTransmitting = false;
-    let activeTab: 'send' | 'files' | 'receive' = 'send';
+    let activeTab: 'send' | 'files' | 'receive' | 'manage' = 'send';
     let showHelpModal = false;
     
     // File transfer
@@ -67,6 +66,30 @@
         totalFailed: 0,
         sessions: [] as string[]
     };
+
+    // Session management
+    let sendSessions: Array<{
+        sessionId: string;
+        total: number;
+        sentChunks: number[];
+        sentParity: string[];
+        protocolName: string;
+        createdAt: Date;
+        fecScheme: { name: string; groupSize: number; parityCount: number };
+    }> = [];
+
+    let receiveSessions: Array<{
+        sessionId: string;
+        total: number;
+        receivedChunks: number[];
+        receivedParity: string[];
+        missingChunks: number[];
+        fecScheme: { name: string; groupSize: number; parityCount: number };
+    }> = [];
+
+    let selectedChunksForResend: { [sessionId: string]: Set<number> } = {};
+    let selectedParityForResend: { [sessionId: string]: Set<string> } = {};
+    let isResending = false;
 
     onMount(async () => {
         ggwaveService = new GGWaveService();
@@ -129,7 +152,7 @@
             };
             
             // Get FEC scheme from service
-            const fecScheme = (ggwaveService.constructor as any).FEC_SCHEMES[selectedFecScheme] || (ggwaveService.constructor as any).DEFAULT_FEC_SCHEME;
+            const fecScheme = (ggwaveService.constructor as any).DEFAULT_FEC_SCHEME;
             
             await ggwaveService.sendLargeData(textToSend, selectedProtocol, useCompression, fecScheme, (progress) => {
                 transmissionProgress = {
@@ -139,6 +162,9 @@
                     phase: progress.type,
                     lastPacket: progress.packet
                 };
+                
+                // Update sessions in real-time
+                loadSessions();
                 
                 if (progress.type === 'start') {
                     const fecInfo = progress.fecInfo ? ` (FEC: ${progress.fecInfo.scheme})` : '';
@@ -201,6 +227,9 @@
                     };
                     receivedMessages = [message, ...receivedMessages];
                     receivedText = text;
+                    
+                    // Update sessions in real-time for received messages
+                    loadSessions();
                     status = `📥 Text message received (${text.length} characters)`;
                 }
                 
@@ -304,13 +333,16 @@
         fileTransferProgress.type = 'idle';
         
         try {
-            const fecScheme = (ggwaveService.constructor as any).FEC_SCHEMES[selectedFecScheme] || (ggwaveService.constructor as any).DEFAULT_FEC_SCHEME;
+            const fecScheme = (ggwaveService.constructor as any).DEFAULT_FEC_SCHEME;
             
             await ggwaveService.sendFiles(
                 selectedFiles,
                 selectedProtocol,
                 fecScheme,
                 (progress) => {
+                    // Update sessions in real-time
+                    loadSessions();
+                    
                     if (progress.type === 'zip-creation') {
                         fileTransferProgress.type = 'zip-creation';
                         if (progress.zipInfo) {
@@ -405,6 +437,146 @@
             console.error('Delete error:', error);
         }
     }
+
+    // Session management functions
+    function loadSessions() {
+        if (ggwaveService) {
+            sendSessions = ggwaveService.getSendSessions();
+            receiveSessions = ggwaveService.getReceiveSessions();
+        }
+    }
+
+    function toggleChunkSelection(sessionId: string, chunkNumber: number) {
+        if (!selectedChunksForResend[sessionId]) {
+            selectedChunksForResend[sessionId] = new Set();
+        }
+        
+        if (selectedChunksForResend[sessionId].has(chunkNumber)) {
+            selectedChunksForResend[sessionId].delete(chunkNumber);
+        } else {
+            selectedChunksForResend[sessionId].add(chunkNumber);
+        }
+        
+        // Trigger reactivity
+        selectedChunksForResend = { ...selectedChunksForResend };
+    }
+
+    function toggleParitySelection(sessionId: string, parityKey: string) {
+        if (!selectedParityForResend[sessionId]) {
+            selectedParityForResend[sessionId] = new Set();
+        }
+        
+        if (selectedParityForResend[sessionId].has(parityKey)) {
+            selectedParityForResend[sessionId].delete(parityKey);
+        } else {
+            selectedParityForResend[sessionId].add(parityKey);
+        }
+        
+        // Trigger reactivity
+        selectedParityForResend = { ...selectedParityForResend };
+    }
+
+    async function resendSelectedChunks(sessionId: string) {
+        const chunksToResend = selectedChunksForResend[sessionId];
+        if (!chunksToResend || chunksToResend.size === 0) {
+            status = 'No chunks selected for resend';
+            return;
+        }
+
+        isResending = true;
+        try {
+            await ggwaveService.resendChunks(
+                sessionId,
+                Array.from(chunksToResend),
+                (progress) => {
+                    status = `🔄 Resending chunk ${progress.chunkNumber} (${progress.current}/${progress.total})`;
+                    loadSessions();
+                }
+            );
+            
+            status = `✅ Resent ${chunksToResend.size} chunks for session ${sessionId}`;
+            
+            // Clear selection and refresh sessions
+            selectedChunksForResend[sessionId] = new Set();
+            selectedChunksForResend = { ...selectedChunksForResend };
+            loadSessions();
+            
+        } catch (error) {
+            status = `❌ Error resending chunks: ${error}`;
+        } finally {
+            isResending = false;
+        }
+    }
+
+    async function resendSelectedParity(sessionId: string) {
+        const parityToResend = selectedParityForResend[sessionId];
+        if (!parityToResend || parityToResend.size === 0) {
+            status = 'No parity packets selected for resend';
+            return;
+        }
+
+        isResending = true;
+        try {
+            await ggwaveService.resendParity(
+                sessionId,
+                Array.from(parityToResend),
+                (progress) => {
+                    status = `🔄 Resending parity ${progress.parityKey} (${progress.current}/${progress.total})`;
+                    loadSessions();
+                }
+            );
+            
+            status = `✅ Resent ${parityToResend.size} parity packets for session ${sessionId}`;
+            
+            // Clear selection and refresh sessions
+            selectedParityForResend[sessionId] = new Set();
+            selectedParityForResend = { ...selectedParityForResend };
+            loadSessions();
+            
+        } catch (error) {
+            status = `❌ Error resending parity: ${error}`;
+        } finally {
+            isResending = false;
+        }
+    }
+
+
+    function clearSession(sessionId: string) {
+        if (ggwaveService.deleteSendSession(sessionId)) {
+            status = `🗑️ Cleared session ${sessionId}`;
+            loadSessions();
+            
+            // Clear selections for this session
+            delete selectedChunksForResend[sessionId];
+            delete selectedParityForResend[sessionId];
+            selectedChunksForResend = { ...selectedChunksForResend };
+            selectedParityForResend = { ...selectedParityForResend };
+        }
+    }
+
+    function startNewSession() {
+        // Clear all sessions and reset to initial state
+        if (ggwaveService.clearAllSendSessions) {
+            ggwaveService.clearAllSendSessions();
+        }
+        if (ggwaveService.clearAllReceiveSessions) {  
+            ggwaveService.clearAllReceiveSessions();
+        }
+        
+        // Reset UI state
+        sendSessions = [];
+        receiveSessions = [];
+        selectedChunksForResend = {};
+        selectedParityForResend = {};
+        receivedMessages = [];
+        transmissionProgress = { phase: 'idle', sessionId: '', current: 0, total: 0 };
+        
+        // Reset to Send tab
+        activeTab = 'send';
+        
+        status = `🆕 New session started - all data cleared`;
+    }
+
 
     // Set up file transfer progress listener
     onMount(() => {
@@ -522,23 +694,12 @@
                     </div>
                     
                     <div class="form-group">
-                        <label for="fecScheme">Error Correction (FEC):</label>
-                        <select id="fecScheme" bind:value={selectedFecScheme} class="protocol-select">
-                            <option value="NONE">No protection (0% overhead)</option>
-                            <option value="BASIC_4">Simple protection 4:1 (25% overhead)</option>
-                            <option value="BASIC_2">Simple protection 2:1 (50% overhead)</option>
-                            <option value="OVERLAPPING_3">Enhanced overlapping protection (67% overhead)</option>
-                        </select>
+                        <label>Error Correction:</label>
+                        <div class="fec-info">
+                            <strong>⛲ Fountain XOR (20% overhead)</strong>
+                        </div>
                         <small class="fec-description">
-                            {#if selectedFecScheme === 'NONE'}
-                                📈 Very reliable channel / performance testing - Maximum speed, zero complexity
-                            {:else if selectedFecScheme === 'BASIC_4'}
-                                🛡️ Simple protection - isolated error acceptable - Keeps 75% payload; 1 error per group
-                            {:else if selectedFecScheme === 'BASIC_2'}
-                                🛡️🛡️ Simple protection - slightly worse channel - Handles loss of up to 33% in group (1/2)
-                            {:else if selectedFecScheme === 'OVERLAPPING_3'}
-                                🛡️🛡️🛡️ Enhanced protection without inflating overhead - Tolerates burst of up to 4 consecutive packets, covering each data twice
-                            {/if}
+                            Simplified fountain approach using XOR patterns. Generates redundant symbols for error recovery.
                         </small>
                     </div>
                     
@@ -552,8 +713,8 @@
                                     <span>Phase: {transmissionProgress.phase.toUpperCase()}</span>
                                 </div>
                                 <div class="progress-subheader">
-                                    <span>FEC Scheme: {ggwaveService ? (ggwaveService.constructor as any).FEC_SCHEMES[selectedFecScheme]?.name || selectedFecScheme : selectedFecScheme}</span>
-                                    <span>Group Size: {ggwaveService ? (ggwaveService.constructor as any).FEC_SCHEMES[selectedFecScheme]?.groupSize || 'N/A' : 'N/A'}</span>
+                                    <span>FEC Scheme: Fountain XOR (20% overhead)</span>
+                                    <span>Group Size: 10</span>
                                 </div>
                                 
                                 <div class="progress-bar-container">
@@ -580,6 +741,105 @@
                             </div>
                         </div>
                     {/if}
+                    
+                    <!-- Send Sessions -->
+                    {#if sendSessions.length > 0}
+                        <div class="sessions-section">
+                            <h4>📤 Active Send Sessions ({sendSessions.length})</h4>
+                            {#each sendSessions as session}
+                                <div class="session-card">
+                                    <div class="session-header">
+                                        <div class="session-info">
+                                            <h5>Session: {session.sessionId}</h5>
+                                            <div class="session-meta">
+                                                <span>Protocol: {session.protocolName}</span>
+                                                <span>FEC: {session.fecScheme.name}</span>
+                                                <span>Created: {session.createdAt.toLocaleTimeString()}</span>
+                                            </div>
+                                        </div>
+                                        <div class="session-actions">
+                                            <button 
+                                                class="btn btn-small btn-danger" 
+                                                on:click={() => clearSession(session.sessionId)}
+                                                disabled={isResending}>
+                                                🗑️ Clear
+                                            </button>
+                                        </div>
+                                    </div>
+                                    
+                                    <div class="session-progress">
+                                        <div class="progress-header">
+                                            <span>Sent: {session.sentChunks.length}/{session.total} chunks</span>
+                                            <span>Parity: {session.sentParity.length} packets</span>
+                                        </div>
+                                        
+                                        <div class="chunk-selection-grid">
+                                            <h6>📦 Data Chunks (click to select for resend)</h6>
+                                            <div class="chunk-grid selectable">
+                                                {#each Array(session.total) as _, i}
+                                                    {@const chunkNumber = i + 1}
+                                                    {@const isSent = session.sentChunks.includes(chunkNumber)}
+                                                    {@const isSelected = selectedChunksForResend[session.sessionId]?.has(chunkNumber) || false}
+                                                    <button 
+                                                        class="chunk-indicator {isSent ? 'sent' : 'pending'} {isSelected ? 'selected' : ''}"
+                                                        on:click={() => toggleChunkSelection(session.sessionId, chunkNumber)}
+                                                        disabled={isResending}
+                                                        title="{isSent ? 'Sent' : 'Pending'} - Click to {isSelected ? 'deselect' : 'select'} for resend">
+                                                        {chunkNumber}
+                                                    </button>
+                                                {/each}
+                                            </div>
+                                            
+                                            <div class="resend-controls">
+                                                <button 
+                                                    class="btn btn-small btn-secondary"
+                                                    on:click={() => resendSelectedChunks(session.sessionId)}
+                                                    disabled={isResending || !selectedChunksForResend[session.sessionId]?.size}>
+                                                    🔄 Resend Selected Chunks ({selectedChunksForResend[session.sessionId]?.size || 0})
+                                                </button>
+                                            </div>
+                                        </div>
+                                        
+                                        {#if session.sentParity.length > 0}
+                                            <div class="parity-selection-grid">
+                                                <h6>🔧 Parity Packets (click to select for resend)</h6>
+                                                <div class="parity-grid selectable">
+                                                    {#each session.sentParity as parityKey}
+                                                        {@const isSelected = selectedParityForResend[session.sessionId]?.has(parityKey) || false}
+                                                        <button 
+                                                            class="parity-indicator sent {isSelected ? 'selected' : ''}"
+                                                            on:click={() => toggleParitySelection(session.sessionId, parityKey)}
+                                                            disabled={isResending}
+                                                            title="Sent - Click to {isSelected ? 'deselect' : 'select'} for resend">
+                                                            P{parityKey}
+                                                        </button>
+                                                    {/each}
+                                                </div>
+                                                
+                                                <div class="resend-controls">
+                                                    <button 
+                                                        class="btn btn-small btn-secondary"
+                                                        on:click={() => resendSelectedParity(session.sessionId)}
+                                                        disabled={isResending || !selectedParityForResend[session.sessionId]?.size}>
+                                                        🔄 Resend Selected Parity ({selectedParityForResend[session.sessionId]?.size || 0})
+                                                    </button>
+                                                </div>
+                                            </div>
+                                        {/if}
+                                    </div>
+                                </div>
+                            {/each}
+                        </div>
+                    {/if}
+                    
+                    <div class="management-controls">
+                        <button 
+                            class="btn btn-small btn-secondary"
+                            on:click={startNewSession}
+                            disabled={isResending}>
+                            🆕 New Session
+                        </button>
+                    </div>
                 </div>
             {:else if activeTab === 'files'}
                 <div class="panel files-panel">
@@ -630,6 +890,96 @@
                                     <p>Progress: {fileTransferProgress.current}/{fileTransferProgress.total} chunks ({((fileTransferProgress.current / fileTransferProgress.total) * 100).toFixed(1)}%)</p>
                                 </div>
                             {/if}
+                        </div>
+                    {/if}
+                    
+                    <!-- Send Sessions -->
+                    {#if sendSessions.length > 0}
+                        <div class="sessions-section">
+                            <h4>📤 Active Send Sessions ({sendSessions.length})</h4>
+                            {#each sendSessions as session}
+                                <div class="session-card">
+                                    <div class="session-header">
+                                        <div class="session-info">
+                                            <h5>Session: {session.sessionId}</h5>
+                                            <div class="session-meta">
+                                                <span>Protocol: {session.protocolName}</span>
+                                                <span>FEC: {session.fecScheme.name}</span>
+                                                <span>Created: {session.createdAt.toLocaleTimeString()}</span>
+                                            </div>
+                                        </div>
+                                        <div class="session-actions">
+                                            <button 
+                                                class="btn btn-small btn-danger" 
+                                                on:click={() => clearSession(session.sessionId)}
+                                                disabled={isResending}>
+                                                🗑️ Clear
+                                            </button>
+                                        </div>
+                                    </div>
+                                    
+                                    <div class="session-progress">
+                                        <div class="progress-header">
+                                            <span>Sent: {session.sentChunks.length}/{session.total} chunks</span>
+                                            <span>Parity: {session.sentParity.length} packets</span>
+                                        </div>
+                                        
+                                        <div class="chunk-selection-grid">
+                                            <h6>📦 Data Chunks (click to select for resend)</h6>
+                                            <div class="chunk-grid selectable">
+                                                {#each Array(session.total) as _, i}
+                                                    {@const chunkNumber = i + 1}
+                                                    {@const isSent = session.sentChunks.includes(chunkNumber)}
+                                                    {@const isSelected = selectedChunksForResend[session.sessionId]?.has(chunkNumber) || false}
+                                                    <button 
+                                                        class="chunk-indicator {isSent ? 'sent' : 'pending'} {isSelected ? 'selected' : ''}"
+                                                        on:click={() => toggleChunkSelection(session.sessionId, chunkNumber)}
+                                                        disabled={isResending}
+                                                        title="{isSent ? 'Sent' : 'Pending'} - Click to {isSelected ? 'deselect' : 'select'} for resend">
+                                                        {chunkNumber}
+                                                    </button>
+                                                {/each}
+                                            </div>
+                                            
+                                            <div class="resend-controls">
+                                                <button 
+                                                    class="btn btn-small btn-secondary"
+                                                    on:click={() => resendSelectedChunks(session.sessionId)}
+                                                    disabled={isResending || !selectedChunksForResend[session.sessionId]?.size}>
+                                                    🔄 Resend Selected Chunks ({selectedChunksForResend[session.sessionId]?.size || 0})
+                                                </button>
+                                            </div>
+                                        </div>
+                                        
+                                        {#if session.sentParity.length > 0}
+                                            <div class="parity-selection-grid">
+                                                <h6>🔧 Parity Packets (click to select for resend)</h6>
+                                                <div class="parity-grid selectable">
+                                                    {#each session.sentParity as parityKey}
+                                                        {@const isSelected = selectedParityForResend[session.sessionId]?.has(parityKey) || false}
+                                                        <button 
+                                                            class="parity-indicator sent {isSelected ? 'selected' : ''}"
+                                                            on:click={() => toggleParitySelection(session.sessionId, parityKey)}
+                                                            disabled={isResending}
+                                                            title="Sent - Click to {isSelected ? 'deselect' : 'select'} for resend">
+                                                            P{parityKey}
+                                                        </button>
+                                                    {/each}
+                                                </div>
+                                                
+                                                <div class="resend-controls">
+                                                    <button 
+                                                        class="btn btn-small btn-secondary"
+                                                        on:click={() => resendSelectedParity(session.sessionId)}
+                                                        disabled={isResending || !selectedParityForResend[session.sessionId]?.size}>
+                                                        🔄 Resend Selected Parity ({selectedParityForResend[session.sessionId]?.size || 0})
+                                                    </button>
+                                                </div>
+                                            </div>
+                                        {/if}
+                                    </div>
+                                </div>
+                            {/each}
                         </div>
                     {/if}
 
@@ -747,6 +1097,72 @@
                     {:else if receptionProgress.phase === 'idle'}
                         <div class="no-messages">
                             <p>No items received yet. Start listening to capture incoming transmissions (text or files).</p>
+                        </div>
+                    {/if}
+                    
+                    <!-- Receive Sessions -->
+                    {#if receiveSessions.length > 0}
+                        <div class="sessions-section">
+                            <h4>📥 Active Receive Sessions ({receiveSessions.length})</h4>
+                            {#each receiveSessions as session}
+                                <div class="session-card">
+                                    <div class="session-header">
+                                        <div class="session-info">
+                                            <h5>Session: {session.sessionId}</h5>
+                                            <div class="session-meta">
+                                                <span>FEC: {session.fecScheme.name}</span>
+                                                <span>Missing: {session.missingChunks.length} chunks</span>
+                                                <span>Progress: {session.receivedChunks.length}/{session.total}</span>
+                                            </div>
+                                        </div>
+                                    </div>
+                                    
+                                    <div class="session-progress">
+                                        <div class="progress-header">
+                                            <span>Received: {session.receivedChunks.length}/{session.total} chunks</span>
+                                            <span>Parity: {session.receivedParity.length} packets</span>
+                                        </div>
+                                        
+                                        <div class="chunk-selection-grid">
+                                            <h6>📦 Data Chunks Status</h6>
+                                            <div class="chunk-grid">
+                                                {#each Array(session.total) as _, i}
+                                                    {@const chunkNumber = i + 1}
+                                                    {@const isReceived = session.receivedChunks.includes(chunkNumber)}
+                                                    {@const isMissing = session.missingChunks.includes(chunkNumber)}
+                                                    <div 
+                                                        class="chunk-indicator {isReceived ? 'received' : isMissing ? 'missing' : 'pending'}"
+                                                        title="{isReceived ? 'Received' : isMissing ? 'Missing' : 'Pending'}">
+                                                        {chunkNumber}
+                                                    </div>
+                                                {/each}
+                                            </div>
+                                        </div>
+                                        
+                                        {#if session.receivedParity.length > 0}
+                                            <div class="parity-info">
+                                                <h6>🔧 Received Parity Packets</h6>
+                                                <div class="parity-grid">
+                                                    {#each session.receivedParity as parityKey}
+                                                        <div class="parity-indicator received" title="Received">
+                                                            P{parityKey}
+                                                        </div>
+                                                    {/each}
+                                                </div>
+                                            </div>
+                                        {/if}
+                                        
+                                        {#if session.missingChunks.length > 0}
+                                            <div class="missing-chunks-info">
+                                                <h6>❌ Missing Chunks ({session.missingChunks.length})</h6>
+                                                <div class="missing-chunks-list">
+                                                    {session.missingChunks.join(', ')}
+                                                </div>
+                                            </div>
+                                        {/if}
+                                    </div>
+                                </div>
+                            {/each}
                         </div>
                     {/if}
                 </div>
@@ -1088,6 +1504,14 @@
     .protocol-description {
         font-style: italic;
         color: #5a6c7d !important;
+    }
+    
+    .fec-info {
+        padding: 8px 12px;
+        background: #e7f3ff;
+        border: 1px solid #bee5eb;
+        border-radius: 4px;
+        margin-bottom: 8px;
     }
     
     .fec-description {
@@ -1963,6 +2387,184 @@
         }
     }
 
+    /* Session Management Styles */
+    .manage-panel {
+        min-height: 500px;
+    }
+
+    .sessions-section {
+        margin-bottom: 30px;
+    }
+
+    .sessions-section h4 {
+        margin: 0 0 15px 0;
+        color: #495057;
+        font-size: 18px;
+        border-bottom: 2px solid #e9ecef;
+        padding-bottom: 8px;
+    }
+
+    .session-card {
+        background: #f8f9fa;
+        border: 1px solid #e9ecef;
+        border-radius: 8px;
+        margin-bottom: 20px;
+        overflow: hidden;
+    }
+
+    .session-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: flex-start;
+        padding: 15px;
+        background: white;
+        border-bottom: 1px solid #e9ecef;
+    }
+
+    .session-info h5 {
+        margin: 0 0 8px 0;
+        font-size: 16px;
+        color: #495057;
+        font-family: monospace;
+    }
+
+    .session-meta {
+        display: flex;
+        gap: 15px;
+        font-size: 12px;
+        color: #6c757d;
+        flex-wrap: wrap;
+    }
+
+    .session-meta span {
+        background: #e9ecef;
+        padding: 2px 6px;
+        border-radius: 3px;
+        font-family: monospace;
+    }
+
+    .session-progress {
+        padding: 15px;
+    }
+
+    .chunk-selection-grid, .parity-selection-grid {
+        margin: 15px 0;
+    }
+
+    .chunk-selection-grid h6, .parity-selection-grid h6 {
+        margin: 0 0 10px 0;
+        font-size: 14px;
+        color: #495057;
+    }
+
+    .chunk-grid.selectable .chunk-indicator {
+        cursor: pointer;
+        transition: all 0.2s ease;
+    }
+
+    .chunk-grid.selectable .chunk-indicator:hover:not(:disabled) {
+        transform: scale(1.1);
+        box-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
+    }
+
+    .chunk-indicator.selected {
+        background: #ffc107 !important;
+        color: #000 !important;
+        border-color: #ffc107 !important;
+        box-shadow: 0 0 0 2px rgba(255, 193, 7, 0.5);
+    }
+
+    .parity-grid.selectable .parity-indicator {
+        cursor: pointer;
+        transition: all 0.2s ease;
+    }
+
+    .parity-grid.selectable .parity-indicator:hover:not(:disabled) {
+        transform: scale(1.1);
+        box-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
+    }
+
+    .parity-indicator.selected {
+        background: #ffc107 !important;
+        color: #000 !important;
+        border-color: #ffc107 !important;
+        box-shadow: 0 0 0 2px rgba(255, 193, 7, 0.5);
+    }
+
+    .resend-controls {
+        margin-top: 10px;
+        display: flex;
+        gap: 10px;
+        align-items: center;
+    }
+
+    .missing-chunks-info {
+        margin-top: 15px;
+        padding: 10px;
+        background: #fff3cd;
+        border: 1px solid #ffeaa7;
+        border-radius: 6px;
+    }
+
+    .missing-chunks-info h6 {
+        margin: 0 0 8px 0;
+        font-size: 14px;
+        color: #856404;
+    }
+
+    .missing-chunks-list {
+        font-family: monospace;
+        font-size: 12px;
+        color: #856404;
+        word-wrap: break-word;
+    }
+
+    .no-sessions {
+        text-align: center;
+        color: #7f8c8d;
+        font-style: italic;
+        padding: 40px 20px;
+        background: #f8f9fa;
+        border-radius: 8px;
+        border: 1px solid #e9ecef;
+        margin: 20px 0;
+    }
+
+    .management-controls {
+        margin-top: 30px;
+        padding-top: 20px;
+        border-top: 2px solid #e9ecef;
+        display: flex;
+        gap: 15px;
+        justify-content: center;
+        flex-wrap: wrap;
+    }
+
+    @media (max-width: 768px) {
+        .session-header {
+            flex-direction: column;
+            gap: 10px;
+            align-items: stretch;
+        }
+
+        .session-meta {
+            flex-direction: column;
+            gap: 5px;
+        }
+
+        .session-actions {
+            align-self: flex-end;
+        }
+
+        .management-controls {
+            flex-direction: column;
+        }
+
+        .management-controls .btn {
+            width: 100%;
+        }
+    }
+
     @media (max-width: 480px) {
         .controls-section .button-group {
             flex-direction: column;
@@ -1983,6 +2585,15 @@
         .tab-button {
             font-size: 13px;
             padding: 10px 12px;
+        }
+
+        .resend-controls {
+            flex-direction: column;
+            align-items: stretch;
+        }
+
+        .resend-controls .btn {
+            width: 100%;
         }
     }
 </style>

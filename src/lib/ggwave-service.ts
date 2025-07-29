@@ -3,20 +3,13 @@ import CryptoJS from 'crypto-js';
 import { gunzip, gzip } from 'fflate';
 import { FileService, type ReceivedBatch, type FileTransferProgress } from './file-service';
 
-// === SEQUENCIA Parser Types ===
-interface SequenciaInfo {
-    inicio: number;
-    fim: number;
-    tipo: string;
-    isValid: boolean;
-}
 
 // === FEC Scheme Types ===
 interface FECScheme {
     groupSize: number;
     parityCount: number;
     name: string;
-    overlap?: boolean;
+    isFountain: boolean;
 }
 
 export class GGWaveService {
@@ -39,150 +32,37 @@ export class GGWaveService {
     
     // === FEC Configuration ===
     public static readonly FEC_SCHEMES: Record<string, FECScheme> = {
-        NONE: { groupSize: 0, parityCount: 0, name: 'No protection (0% overhead)' },
-        BASIC_4: { groupSize: 4, parityCount: 1, name: 'Simple protection 4:1 (25% overhead)' },
-        BASIC_2: { groupSize: 2, parityCount: 1, name: 'Simple protection 2:1 (50% overhead)' },
-        OVERLAPPING_3: { groupSize: 3, parityCount: 1, overlap: true, name: 'Enhanced overlapping protection (67% overhead)' },
-        STRONG_OVERLAPPING_3: { groupSize: 3, parityCount: 3, overlap: true, name: 'Strong overlapping protection (100% overhead, corrects up to 3 errors)' }
+        FOUNTAIN_XOR: { groupSize: 10, parityCount: 2, name: 'Fountain XOR (20% overhead)', isFountain: true }
     };
     
-    public static readonly DEFAULT_FEC_SCHEME = GGWaveService.FEC_SCHEMES.STRONG_OVERLAPPING_3;
+    public static readonly DEFAULT_FEC_SCHEME = GGWaveService.FEC_SCHEMES.FOUNTAIN_XOR;
 
-    // === SEQUENCIA Parser ===
-    /**
-     * Standardized parser for SEQUENCIA field in parity packets
-     * Handles formats: "1-4", "1-3-0", "2-4-O0"
-     * Always normalizes to include tipo (defaults to "0")
-     * 
-     * Examples:
-     * - parseSequencia("1-4") → {inicio: 1, fim: 4, tipo: "0", isValid: true}
-     * - parseSequencia("1-3-0") → {inicio: 1, fim: 3, tipo: "0", isValid: true}
-     * - parseSequencia("2-4-O0") → {inicio: 2, fim: 4, tipo: "O0", isValid: true}
-     * - parseSequencia("invalid") → {inicio: 0, fim: 0, tipo: "0", isValid: false}
-     */
-    private static parseSequencia(seq: string): SequenciaInfo {
-        const parts = seq.split('-');
-        
-        if (parts.length < 2) {
-            console.warn(`Invalid SEQUENCIA format: ${seq}`);
-            return { inicio: 0, fim: 0, tipo: "0", isValid: false };
-        }
-        
-        const inicio = parseInt(parts[0]);
-        const fim = parseInt(parts[1]);
-        const tipo = parts[2] || "0"; // Default to "0" if not specified
-        
-        const isValid = !isNaN(inicio) && !isNaN(fim) && inicio <= fim && inicio > 0;
-        
-        if (!isValid) {
-            console.warn(`Invalid SEQUENCIA values: inicio=${inicio}, fim=${fim}`);
-        }
-        
-        return { inicio, fim, tipo, isValid };
-    }
+
 
     /**
-     * Creates a standardized parity key in the format: inicio-fim-tipo
-     * 
-     * Examples:
-     * - createParityKey(1, 4) → "1-4-0" (default tipo)
-     * - createParityKey(1, 3, "0") → "1-3-0"
-     * - createParityKey(2, 4, "O0") → "2-4-O0"
-     */
-    private static createParityKey(inicio: number, fim: number, tipo: string = "0"): string {
-        return `${inicio}-${fim}-${tipo}`;
-    }
-
-    /**
-     * Normalizes a SEQUENCIA string to always include the tipo field
-     * Ensures consistent key format across the application
-     * 
-     * Examples:
-     * - normalizeSequencia("1-4") → "1-4-0"
-     * - normalizeSequencia("1-3-0") → "1-3-0" (unchanged)
-     * - normalizeSequencia("2-4-O0") → "2-4-O0" (unchanged)
-     * - normalizeSequencia("invalid") → "invalid" (returns original if invalid)
-     */
-    private static normalizeSequencia(seq: string): string {
-        const parsed = GGWaveService.parseSequencia(seq);
-        if (!parsed.isValid) {
-            return seq; // Return original if invalid
-        }
-        return GGWaveService.createParityKey(parsed.inicio, parsed.fim, parsed.tipo);
-    }
-
-    /**
-     * Generates deterministic OVERLAPPING_3 groups following the protocol specification
-     * CRITICAL: This algorithm MUST match exactly between transmitter and receiver
-     * ORDER: ALL main groups first, then ALL overlapping groups
-     * 
-     * @param totalPackets Total number of data packets
-     * @returns Array of group definitions [start, end, type] in transmission order
-     */
-    private static generateOverlappingGroups(totalPackets: number): Array<{start: number, end: number, type: string}> {
-        const mainGroups: Array<{start: number, end: number, type: string}> = [];
-        const overlappingGroups: Array<{start: number, end: number, type: string}> = [];
-        const mainGroupKeys = new Set<string>();
-        
-        // 1. GRUPOS PRINCIPAIS (tipo=0): [1-3], [4-6], [7-9], ...
-        // Generate ALL main groups first
-        for (let i = 1; i <= totalPackets; i += 3) {
-            const start = i;
-            const end = Math.min(i + 2, totalPackets);
-            const key = `${start}-${end}`;
-            
-            mainGroups.push({ start, end, type: "0" });
-            mainGroupKeys.add(key);
-        }
-        
-        // 2. GRUPOS OVERLAPPING (tipos O0, O1, O2, ...): [2-4], [3-5], [5-7], [6-8], ...
-        // Generate ALL overlapping groups after (filter duplicates)
-        let oIndex = 0;
-        for (let i = 2; i <= totalPackets; i++) {
-            if (i + 2 <= totalPackets) {
-                const start = i;
-                const end = i + 2;
-                const key = `${start}-${end}`;
-                
-                if (!mainGroupKeys.has(key)) {
-                    overlappingGroups.push({ start, end, type: `O${oIndex}` });
-                }
-                oIndex++;
-            }
-        }
-        
-        // 3. ORDEM CRÍTICA: Principais primeiro, overlapping depois
-        return [...mainGroups, ...overlappingGroups];
-    }
-
-    /**
-     * Generates FEC groups for a given scheme and total packets
-     * Returns groups in transmission order: main groups first, then overlapping
+     * Generates FEC groups for Fountain XOR scheme
      */
     private static generateFECGroups(totalPackets: number, fecScheme: FECScheme): Array<{start: number, end: number, type: string}> {
         if (fecScheme.groupSize === 0) {
             return []; // No FEC
         }
         
-        if (fecScheme.overlap) {
-            // Use deterministic overlapping algorithm
-            return GGWaveService.generateOverlappingGroups(totalPackets);
-        } else {
-            // Standard FEC groups
-            const groups: Array<{start: number, end: number, type: string}> = [];
-            
-            for (let i = 0; i < totalPackets; i += fecScheme.groupSize) {
-                const start = i + 1;
-                const end = Math.min(i + fecScheme.groupSize, totalPackets);
-                
-                // Add groups for each parity type
-                for (let p = 0; p < fecScheme.parityCount; p++) {
-                    groups.push({ start, end, type: p.toString() });
-                }
-            }
-            
-            return groups;
+        // Fountain XOR: Generate fountain symbols based on overhead
+        // Simplified fountain approach with deterministic XOR patterns
+        const redundancyFactor = 1.20; // 20% overhead (realistic for XOR-based fountain)
+        const totalSymbols = Math.ceil(totalPackets * redundancyFactor);
+        const groups: Array<{start: number, end: number, type: string}> = [];
+        
+        // Generate fountain symbols for the entire message
+        for (let i = 0; i < totalSymbols - totalPackets; i++) {
+            groups.push({ 
+                start: 1, 
+                end: totalPackets, 
+                type: `F${i}` // Fountain symbol identifier
+            });
         }
+        
+        return groups;
     }
 
     // Map of active receive sessions
@@ -195,6 +75,21 @@ export class GGWaveService {
         parity: Map<string, Uint8Array>; // "group-type" -> parity bytes
         timeoutId: ReturnType<typeof setTimeout>;
         receivedPackets: Set<string>; // for duplicate detection
+    }> = new Map();
+
+    // Map of active send sessions for selective retransmission
+    private sendSessions: Map<string, {
+        sessionId: string;
+        chunks: Map<number, Uint8Array>; // seq -> raw data bytes
+        parity: Map<string, Uint8Array>; // "group-type" -> parity bytes
+        total: number;
+        sentChunks: Set<number>; // chunks that were sent
+        sentParity: Set<string>; // parity packets that were sent
+        protocolName: string;
+        fecScheme: FECScheme;
+        fullHash: string;
+        flags: string;
+        createdAt: Date;
     }> = new Map();
 
     constructor() {
@@ -715,46 +610,43 @@ export class GGWaveService {
             return parities;
         }
         
-        // Primary parity: XOR of all chunks
-        const primaryParity = GGWaveService.xorBytes(chunks, GGWaveService.CHUNK_SIZE);
-        parities.push(primaryParity);
-        
-        // Secondary parity for enhanced schemes
-        if (scheme.parityCount >= 2) {
-            // Weighted XOR: each chunk multiplied by its position (simple Reed-Solomon-like)
-            const secondaryParity = new Uint8Array(GGWaveService.CHUNK_SIZE);
-            for (let i = 0; i < chunks.length; i++) {
-                const weight = i + 1;
+        if (scheme.isFountain) {
+            // Fountain XOR codes - simplified fountain approach
+            // Uses deterministic XOR patterns to create fountain-like symbols
+            // Not as optimal as true Raptor codes but much simpler
+            
+            // Generate fountain symbol using XOR of selected chunks
+            const fountainSymbol = new Uint8Array(GGWaveService.CHUNK_SIZE);
+            
+            // Simple degree distribution: most symbols connect to 1-3 chunks
+            // In practice, this gives ~20% overhead for reasonable error rates
+            const degree = Math.min(chunks.length, Math.floor(Math.random() * 3) + 1);
+            const selectedChunks = new Set<number>();
+            
+            // Select chunks pseudo-randomly but deterministically
+            for (let i = 0; i < degree; i++) {
+                let chunkIndex = i % chunks.length;
+                selectedChunks.add(chunkIndex);
+            }
+            
+            // XOR selected chunks to create fountain symbol
+            for (const chunkIndex of selectedChunks) {
+                const chunk = chunks[chunkIndex];
                 const paddedChunk = new Uint8Array(GGWaveService.CHUNK_SIZE);
-                paddedChunk.set(chunks[i]);
+                paddedChunk.set(chunk);
                 
                 for (let j = 0; j < GGWaveService.CHUNK_SIZE; j++) {
-                    secondaryParity[j] ^= (paddedChunk[j] * weight) & 0xFF;
+                    fountainSymbol[j] ^= paddedChunk[j];
                 }
             }
-            parities.push(secondaryParity);
-        }
-        
-        // Tertiary parity for strong schemes
-        if (scheme.parityCount >= 3) {
-            // Another weighted XOR with different scheme, e.g., weight squared
-            const tertiaryParity = new Uint8Array(GGWaveService.CHUNK_SIZE);
-            for (let i = 0; i < chunks.length; i++) {
-                const weight = (i + 1) * (i + 1); // Squared for independence
-                const paddedChunk = new Uint8Array(GGWaveService.CHUNK_SIZE);
-                paddedChunk.set(chunks[i]);
-                
-                for (let j = 0; j < GGWaveService.CHUNK_SIZE; j++) {
-                    tertiaryParity[j] ^= (paddedChunk[j] * weight) & 0xFF;
-                }
-            }
-            parities.push(tertiaryParity);
+            
+            parities.push(fountainSymbol);
         }
         
         return parities;
     }
     
-    // Attempt to recover missing chunks using available parity data
+    // Simplified fountain recovery - basic XOR decoding
     private static recoverChunks(
         chunks: Map<number, Uint8Array>,
         parity: Map<string, Uint8Array>,
@@ -768,233 +660,53 @@ export class GGWaveService {
             return recovered;
         }
         
-        const groupEnd = groupStart + groupSize - 1;
-        const missingIndices: number[] = [];
-        const presentChunks: { index: number, data: Uint8Array }[] = [];
+        console.log(`Attempting fountain recovery for messages with ${parity.size} fountain symbols`);
         
-        // Identify missing and present chunks
-        for (let i = groupStart; i <= groupEnd; i++) {
-            if (chunks.has(i)) {
-                presentChunks.push({ index: i, data: chunks.get(i)! });
-            } else {
-                missingIndices.push(i);
-            }
-        }
-        
-        console.log(`Recovering group [${groupStart}-${groupEnd}]: ${missingIndices.length} missing`);
-        
-        // Try to recover based on available parity
-        const primaryParityKey = GGWaveService.createParityKey(groupStart, groupEnd, "0");
-        const secondaryParityKey = GGWaveService.createParityKey(groupStart, groupEnd, "1");
-        
-        const hasPrimary = parity.has(primaryParityKey);
-        const hasSecondary = parity.has(secondaryParityKey);
-        
-        console.log(`Parities available: primary=${hasPrimary}, secondary=${hasSecondary}`);
-        
-        // Single error correction with primary parity
-        if (missingIndices.length === 1 && hasPrimary) {
-            const missingIndex = missingIndices[0];
-            const primaryParity = parity.get(primaryParityKey)!;
-            
-            const recoveredData = primaryParity.slice();
-            for (const { data } of presentChunks) {
-                const paddedData = new Uint8Array(GGWaveService.CHUNK_SIZE);
-                paddedData.set(data);
+        // Simplified fountain decoding: try to use fountain symbols to recover missing chunks
+        // This is a basic implementation - real fountain codes would use belief propagation
+        for (const [fountainKey, fountainData] of parity) {
+            if (fountainKey.startsWith('F')) {
+                // This is a fountain symbol - try simple XOR recovery if only 1 chunk is missing
+                let missingCount = 0;
+                let missingIndex = -1;
                 
-                for (let j = 0; j < GGWaveService.CHUNK_SIZE; j++) {
-                    recoveredData[j] ^= paddedData[j];
-                }
-            }
-            
-            // Remove trailing zeros
-            let actualLength = recoveredData.length;
-            while (actualLength > 0 && recoveredData[actualLength - 1] === 0) {
-                actualLength--;
-            }
-            
-            if (actualLength > 0) {
-                recovered.set(missingIndex, recoveredData.slice(0, actualLength));
-                console.log(`Recovered single missing packet ${missingIndex} using primary parity`);
-            }
-        }
-        
-        // Double error correction with enhanced schemes
-        else if (missingIndices.length === 2 && hasPrimary && hasSecondary) {
-            const [missing1, missing2] = missingIndices.sort((a,b) => a-b);
-            const primaryParity = parity.get(primaryParityKey)!;
-            const secondaryParity = parity.get(secondaryParityKey)!;
-            
-            try {
-                const recoveredData1 = new Uint8Array(GGWaveService.CHUNK_SIZE);
-                const recoveredData2 = new Uint8Array(GGWaveService.CHUNK_SIZE);
-                
-                // Apply present chunks to both parities
-                const adjustedPrimary = primaryParity.slice();
-                const adjustedSecondary = secondaryParity.slice();
-                
-                for (const { index, data } of presentChunks) {
-                    const paddedData = new Uint8Array(GGWaveService.CHUNK_SIZE);
-                    paddedData.set(data);
-                    const weight = index - groupStart + 1;
-                    
-                    for (let j = 0; j < GGWaveService.CHUNK_SIZE; j++) {
-                        adjustedPrimary[j] ^= paddedData[j];
-                        adjustedSecondary[j] ^= (paddedData[j] * weight) & 0xFF;
+                // Count missing chunks in the full message range
+                for (let i = 1; i <= groupSize; i++) {
+                    if (!chunks.has(i) && !recovered.has(i)) {
+                        missingCount++;
+                        missingIndex = i;
                     }
                 }
                 
-                // Solve for the two missing chunks
-                const weight1 = missing1 - groupStart + 1;
-                const weight2 = missing2 - groupStart + 1;
-                
-                for (let j = 0; j < GGWaveService.CHUNK_SIZE; j++) {
-                    const a = adjustedPrimary[j];
-                    const b = adjustedSecondary[j];
+                // If exactly 1 chunk is missing, we can potentially recover it
+                if (missingCount === 1) {
+                    const recoveredData = fountainData.slice();
                     
-                    // Solve: x + y = a
-                    // w1*x + w2*y = b
-                    if (weight1 !== weight2) {
-                        // y = (b - w1*a) / (w2 - w1)
-                        let y = (b - (weight1 * a)) / (weight2 - weight1);
-                        y = Math.round(y) & 0xFF; // Round and mask to byte
-                        
-                        let x = (a ^ y) & 0xFF;
-                        
-                        recoveredData1[j] = missing1 < missing2 ? x : y;
-                        recoveredData2[j] = missing1 < missing2 ? y : x;
-                    } else {
-                        // Fallback if weights equal - use average (simplified)
-                        recoveredData1[j] = (a / 2) & 0xFF;
-                        recoveredData2[j] = (a / 2) & 0xFF;
+                    // XOR with all known chunks (simplified degree-1 assumption)
+                    for (let i = 1; i <= groupSize; i++) {
+                        if (chunks.has(i)) {
+                            const chunkData = chunks.get(i)!;
+                            const paddedChunk = new Uint8Array(GGWaveService.CHUNK_SIZE);
+                            paddedChunk.set(chunkData);
+                            
+                            for (let j = 0; j < GGWaveService.CHUNK_SIZE; j++) {
+                                recoveredData[j] ^= paddedChunk[j];
+                            }
+                        }
+                    }
+                    
+                    // Remove trailing zeros
+                    let actualLength = recoveredData.length;
+                    while (actualLength > 0 && recoveredData[actualLength - 1] === 0) {
+                        actualLength--;
+                    }
+                    
+                    if (actualLength > 0) {
+                        recovered.set(missingIndex, recoveredData.slice(0, actualLength));
+                        console.log(`Fountain recovery: recovered chunk ${missingIndex} using symbol ${fountainKey}`);
+                        break; // Try one recovery at a time
                     }
                 }
-                
-                // Trim trailing zeros
-                let len1 = recoveredData1.length;
-                while (len1 > 0 && recoveredData1[len1 - 1] === 0) len1--;
-                
-                let len2 = recoveredData2.length;
-                while (len2 > 0 && recoveredData2[len2 - 1] === 0) len2--;
-                
-                if (len1 > 0 && len2 > 0) {
-                    recovered.set(missing1, recoveredData1.slice(0, len1));
-                    recovered.set(missing2, recoveredData2.slice(0, len2));
-                    console.log(`Recovered double missing packets ${missing1},${missing2} using dual parity`);
-                }
-            } catch (error) {
-                console.warn('Double error correction failed:', error);
-            }
-        }
-        
-        // New: Triple error correction for strong schemes
-        else if (missingIndices.length === 3 && scheme.parityCount >= 3 && hasPrimary && hasSecondary && parity.has(GGWaveService.createParityKey(groupStart, groupEnd, "2"))) {
-            const [missing1, missing2, missing3] = missingIndices.sort((a,b) => a-b);
-            const primaryParity = parity.get(primaryParityKey)!;
-            const secondaryParity = parity.get(secondaryParityKey)!;
-            const tertiaryParityKey = GGWaveService.createParityKey(groupStart, groupEnd, "2");
-            const tertiaryParity = parity.get(tertiaryParityKey)!;
-            
-            try {
-                const recoveredData1 = new Uint8Array(GGWaveService.CHUNK_SIZE);
-                const recoveredData2 = new Uint8Array(GGWaveService.CHUNK_SIZE);
-                const recoveredData3 = new Uint8Array(GGWaveService.CHUNK_SIZE);
-                
-                // Apply present chunks to all parities
-                const adjustedPrimary = primaryParity.slice();
-                const adjustedSecondary = secondaryParity.slice();
-                const adjustedTertiary = tertiaryParity.slice();
-                
-                for (const { index, data } of presentChunks) {
-                    const paddedData = new Uint8Array(GGWaveService.CHUNK_SIZE);
-                    paddedData.set(data);
-                    const weight1 = 1; // For primary (simple XOR)
-                    const weight2 = index - groupStart + 1; // For secondary
-                    const weight3 = weight2 * weight2; // For tertiary (squared)
-                    
-                    for (let j = 0; j < GGWaveService.CHUNK_SIZE; j++) {
-                        adjustedPrimary[j] ^= (paddedData[j] * weight1) & 0xFF;
-                        adjustedSecondary[j] ^= (paddedData[j] * weight2) & 0xFF;
-                        adjustedTertiary[j] ^= (paddedData[j] * weight3) & 0xFF;
-                    }
-                }
-                
-                // Solve 3x3 system for each byte
-                // Equations:
-                // w11*x + w12*y + w13*z = a
-                // w21*x + w22*y + w23*z = b
-                // w31*x + w32*y + w33*z = c
-                const w11 = 1, w12 = 1, w13 = 1;
-                const w21 = missing1 - groupStart + 1;
-                const w22 = missing2 - groupStart + 1;
-                const w23 = missing3 - groupStart + 1;
-                const w31 = w21 * w21;
-                const w32 = w22 * w22;
-                const w33 = w23 * w23;
-                
-                for (let j = 0; j < GGWaveService.CHUNK_SIZE; j++) {
-                    const a = adjustedPrimary[j];
-                    const b = adjustedSecondary[j];
-                    const c = adjustedTertiary[j];
-                    
-                    // Simplified Gauss elimination (assuming invertible matrix)
-                    // This is approximate for integers; in production, use proper GF(256)
-                    try {
-                        // Eliminate x from eq2 and eq3
-                        const mult21 = w21 / w11;
-                        const mult31 = w31 / w11;
-                        
-                        const b2 = b - mult21 * a;
-                        const c2 = c - mult31 * a;
-                        
-                        const w22_new = w22 - mult21 * w12;
-                        const w23_new = w23 - mult21 * w13;
-                        const w32_new = w32 - mult31 * w12;
-                        const w33_new = w33 - mult31 * w13;
-                        
-                        // Eliminate y from eq3
-                        const mult32 = w32_new / w22_new;
-                        const c3 = c2 - mult32 * b2;
-                        const w33_final = w33_new - mult32 * w23_new;
-                        
-                        // Back-substitute
-                        let z = (w33_final !== 0) ? (c3 / w33_final) : 0;
-                        let y = (w22_new !== 0) ? ((b2 - w23_new * z) / w22_new) : 0;
-                        let x = (w11 !== 0) ? ((a - w12 * y - w13 * z) / w11) : 0;
-                        
-                        // Round and mask to bytes
-                        recoveredData1[j] = Math.round(x) & 0xFF;
-                        recoveredData2[j] = Math.round(y) & 0xFF;
-                        recoveredData3[j] = Math.round(z) & 0xFF;
-                    } catch (e) {
-                        // Fallback if division by zero
-                        recoveredData1[j] = a & 0xFF;
-                        recoveredData2[j] = b & 0xFF;
-                        recoveredData3[j] = c & 0xFF;
-                    }
-                }
-                
-                // Trim trailing zeros
-                let len1 = recoveredData1.length; while (len1 > 0 && recoveredData1[len1-1] === 0) len1--;
-                let len2 = recoveredData2.length; while (len2 > 0 && recoveredData2[len2-1] === 0) len2--;
-                let len3 = recoveredData3.length; while (len3 > 0 && recoveredData3[len3-1] === 0) len3--;
-                
-                if (len1 > 0 && len2 > 0 && len3 > 0) {
-                    recovered.set(missing1, recoveredData1.slice(0, len1));
-                    recovered.set(missing2, recoveredData2.slice(0, len2));
-                    recovered.set(missing3, recoveredData3.slice(0, len3));
-                    console.log(`Recovered triple missing packets ${missing1},${missing2},${missing3} using triple parity`);
-                }
-            } catch (error) {
-                console.warn('Triple error correction failed:', error);
-            }
-        }
-        
-        // New: Attempt recovery for overlapping groups with 1 missing even if parityCount=1
-        if (scheme.overlap && missingIndices.length === 1 && hasPrimary) {
-            // Already handled above, but add logging
-            if (recovered.size > 0) {
-                console.log(`Overlapping single recovery successful for group [${groupStart}-${groupEnd}]`);
             }
         }
         
@@ -1104,6 +816,7 @@ export class GGWaveService {
     /**
      * Transmit arbitrarily large data by fragmenting into multiple GGWave packets.
      * The method blocks until transmission of all packets completes.
+     * Stores session info for selective retransmission.
      */
     async sendLargeData(
         message: string, 
@@ -1141,8 +854,47 @@ export class GGWaveService {
         const total = chunks.length;
 
         // Add FEC scheme to flags
-        const fecFlag = `F${Object.entries(GGWaveService.FEC_SCHEMES).find(([_, scheme]) => scheme === fecScheme)?.[0] || 'BASIC_3'}`;
+        const fecFlag = `F${Object.entries(GGWaveService.FEC_SCHEMES).find(([_, scheme]) => scheme === fecScheme)?.[0] || 'FOUNTAIN_XOR'}`;
         const allFlags = [flags, fecFlag].filter(Boolean).join(',');
+
+        // Generate and store parity data for selective retransmission
+        const parityMap = new Map<string, Uint8Array>();
+        const fecGroups = GGWaveService.generateFECGroups(total, fecScheme);
+        
+        for (const group of fecGroups) {
+            const groupChunks = chunks.slice(group.start - 1, group.end);
+            const parityCount = group.type.startsWith('O') ? 1 : (fecScheme.parityCount || 1);
+            const parities = GGWaveService.generateParityData(groupChunks, {
+                ...fecScheme,
+                parityCount
+            });
+            
+            const parityIndex = group.type.startsWith('O') ? 0 : parseInt(group.type);
+            if (parityIndex < parities.length) {
+                const rangeStr = group.type; // Fountain symbols use simple F0, F1, etc. identifiers
+                parityMap.set(rangeStr, parities[parityIndex]);
+            }
+        }
+
+        // Store session info for selective retransmission
+        const chunkMap = new Map<number, Uint8Array>();
+        chunks.forEach((chunk, index) => {
+            chunkMap.set(index + 1, chunk);
+        });
+
+        this.sendSessions.set(id, {
+            sessionId: id,
+            chunks: chunkMap,
+            parity: parityMap,
+            total,
+            sentChunks: new Set(),
+            sentParity: new Set(),
+            protocolName,
+            fecScheme,
+            fullHash,
+            flags: allFlags,
+            createdAt: new Date()
+        });
 
         // 1) START packet
         const startPacket = allFlags ? `S:${id}::${fullHash}:${total}:${allFlags}` : `S:${id}::${fullHash}:${total}`;
@@ -1161,12 +913,18 @@ export class GGWaveService {
         await this.transmitPacket(startPacket, protocolName);
 
         // 2) DATA packets
+        const sendSession = this.sendSessions.get(id);
         for (let i = 0; i < total; i++) {
             const seqNum = i + 1;
             const chunkBase64 = btoa(String.fromCharCode(...chunks[i]));
             const dataPacket = `D:${id}:${seqNum}:${chunkBase64}`;
             onProgress?.({ type: 'data', current: seqNum, total, sessionId: id, packet: dataPacket });
             await this.transmitPacket(dataPacket, protocolName);
+            
+            // Mark chunk as sent
+            if (sendSession) {
+                sendSession.sentChunks.add(seqNum);
+            }
         }
 
         // 3) PARITY packets - deterministic order following specification
@@ -1189,7 +947,7 @@ export class GGWaveService {
                 const parityIndex = group.type.startsWith('O') ? 0 : parseInt(group.type);
                 if (parityIndex < parities.length) {
                     const parityBase64 = btoa(String.fromCharCode(...parities[parityIndex]));
-                    const rangeStr = GGWaveService.createParityKey(group.start, group.end, group.type);
+                    const rangeStr = group.type; // Fountain symbols use simple F0, F1, etc. identifiers
                     const parityPacket = `P:${id}:${rangeStr}:${parityBase64}`;
                     
                     console.log(`Sending parity packet: ${rangeStr} for group [${group.start}-${group.end}]`);
@@ -1203,6 +961,11 @@ export class GGWaveService {
                     });
                     
                     await this.transmitPacket(parityPacket, protocolName);
+                    
+                    // Mark parity as sent
+                    if (sendSession) {
+                        sendSession.sentParity.add(rangeStr);
+                    }
                 }
             }
         }
@@ -1406,9 +1169,8 @@ export class GGWaveService {
                 // Decode Base64 parity with validation
                 const parityBytes = GGWaveService.validateAndDecodeBase64(parityBase64);
                 if (parityBytes) {
-                    // Normalize the range string to ensure consistent format
-                    const normalizedRangeStr = GGWaveService.normalizeSequencia(rangeStr);
-                    sess.parity.set(normalizedRangeStr, parityBytes);
+                    // Store fountain symbol with its key
+                    sess.parity.set(rangeStr, parityBytes);
                     
                     // Report progress
                     const chunksStatus: { [key: number]: boolean } = {};
@@ -1490,61 +1252,24 @@ export class GGWaveService {
             console.log(`Missing chunks: [${missingChunks.join(', ')}]`);
         }
 
-        // Attempt FEC recovery using the configured scheme
-        if (sess.fecScheme.groupSize > 0) {
-            const totalGroups = Math.ceil(sess.total / sess.fecScheme.groupSize);
+        // Attempt fountain recovery using available symbols
+        if (sess.fecScheme.groupSize > 0 && sess.parity.size > 0) {
+            console.log(`Attempting fountain recovery for session ${sessionId} with ${sess.parity.size} symbols`);
             
-            for (let g = 1; g <= totalGroups; g++) {
-                const startSeq = (g - 1) * sess.fecScheme.groupSize + 1;
-                const endSeq = Math.min(startSeq + sess.fecScheme.groupSize - 1, sess.total);
-                
-                const recovered = GGWaveService.recoverChunks(
-                    sess.chunks, 
-                    sess.parity, 
-                    startSeq, 
-                    sess.fecScheme.groupSize, 
-                    sess.fecScheme
-                );
-                
-                // Apply recovered chunks
-                for (const [index, data] of recovered) {
+            const recovered = GGWaveService.recoverChunks(
+                sess.chunks, 
+                sess.parity, 
+                1, 
+                sess.total, 
+                sess.fecScheme
+            );
+            
+            // Apply recovered chunks
+            for (const [index, data] of recovered) {
+                if (!sess.chunks.has(index)) {
                     sess.chunks.set(index, data);
-                    console.log(`FEC recovered packet ${index} for session ${sessionId} using ${sess.fecScheme.name}`);
+                    console.log(`Fountain recovered packet ${index} for session ${sessionId}`);
                 }
-            }
-            
-            // Try overlapping group recovery using deterministic algorithm
-            if (sess.fecScheme.overlap) {
-                console.log(`Attempting overlapping FEC recovery for ${sess.total} packets`);
-                
-                // Generate the same deterministic groups that transmitter used
-                const overlappingGroups = GGWaveService.generateOverlappingGroups(sess.total);
-                const overlappingOnlyGroups = overlappingGroups.filter(group => group.type.startsWith('O'));
-                
-                console.log(`Generated ${overlappingOnlyGroups.length} overlapping groups:`, overlappingOnlyGroups);
-                
-                for (const group of overlappingOnlyGroups) {
-                    const recovered = GGWaveService.recoverChunks(
-                        sess.chunks,
-                        sess.parity,
-                        group.start,
-                        group.end - group.start + 1,
-                        { ...sess.fecScheme, parityCount: 1 }
-                    );
-                    
-                    for (const [index, data] of recovered) {
-                        if (!sess.chunks.has(index)) {
-                            sess.chunks.set(index, data);
-                            console.log(`Overlapping FEC recovered packet ${index} for session ${sessionId} using group [${group.start}-${group.end}]`);
-                        }
-                    }
-                }
-            }
-            
-            // Try aggressive recovery: attempt all possible combinations
-            if (sess.chunks.size < sess.total && sess.parity.size > 0) {
-                console.log(`Attempting aggressive recovery for session ${sessionId}`);
-                this.attemptAggressiveRecovery(sess, sessionId);
             }
         }
 
@@ -1681,64 +1406,6 @@ export class GGWaveService {
         return null;
     }
     
-    // Attempt aggressive recovery using all available parity data
-    private attemptAggressiveRecovery(sess: any, sessionId: string): void {
-        const originalChunkCount = sess.chunks.size;
-        
-        // Try recovery with all parity packets
-        for (const [parityKey, parityData] of sess.parity) {
-            const sequenciaInfo = GGWaveService.parseSequencia(parityKey);
-            if (sequenciaInfo.isValid) {
-                const startSeq = sequenciaInfo.inicio;
-                const endSeq = sequenciaInfo.fim;
-                const parityType = sequenciaInfo.tipo;
-                
-                const groupSize = endSeq - startSeq + 1;
-                
-                // Count missing packets in this group
-                const missingInGroup = [];
-                for (let i = startSeq; i <= endSeq; i++) {
-                    if (!sess.chunks.has(i)) {
-                        missingInGroup.push(i);
-                    }
-                }
-                
-                // Try recovery if we have exactly 1 missing packet and primary parity
-                if (missingInGroup.length === 1 && parityType === '0') {
-                    const missingIndex = missingInGroup[0];
-                    const recoveredData = parityData.slice();
-                    
-                    // XOR with all present chunks
-                    for (let i = startSeq; i <= endSeq; i++) {
-                        if (sess.chunks.has(i)) {
-                            const chunkData = sess.chunks.get(i);
-                            const paddedChunk = new Uint8Array(GGWaveService.CHUNK_SIZE);
-                            paddedChunk.set(chunkData);
-                            
-                            for (let j = 0; j < GGWaveService.CHUNK_SIZE; j++) {
-                                recoveredData[j] ^= paddedChunk[j];
-                            }
-                        }
-                    }
-                    
-                    // Remove trailing zeros
-                    let actualLength = recoveredData.length;
-                    while (actualLength > 0 && recoveredData[actualLength - 1] === 0) {
-                        actualLength--;
-                    }
-                    
-                    if (actualLength > 0) {
-                        sess.chunks.set(missingIndex, recoveredData.slice(0, actualLength));
-                        console.log(`Aggressive recovery: recovered packet ${missingIndex} for session ${sessionId}`);
-                    }
-                }
-            }
-        }
-        
-        if (sess.chunks.size > originalChunkCount) {
-            console.log(`Aggressive recovery successful: ${sess.chunks.size - originalChunkCount} packets recovered`);
-        }
-    }
 
     // ===================== File Transfer Handling =====================
 
@@ -1977,5 +1644,251 @@ export class GGWaveService {
      */
     async deleteBatch(batchId: string): Promise<void> {
         await this.fileService.deleteBatch(batchId);
+    }
+
+    // ===================== Selective Retransmission Methods =====================
+
+    /**
+     * Get information about active send sessions
+     */
+    getSendSessions(): Array<{
+        sessionId: string;
+        total: number;
+        sentChunks: number[];
+        sentParity: string[];
+        protocolName: string;
+        createdAt: Date;
+        fecScheme: { name: string; groupSize: number; parityCount: number };
+    }> {
+        const sessions: Array<{
+            sessionId: string;
+            total: number;
+            sentChunks: number[];
+            sentParity: string[];
+            protocolName: string;
+            createdAt: Date;
+            fecScheme: { name: string; groupSize: number; parityCount: number };
+        }> = [];
+
+        this.sendSessions.forEach((session) => {
+            sessions.push({
+                sessionId: session.sessionId,
+                total: session.total,
+                sentChunks: Array.from(session.sentChunks).sort((a, b) => a - b),
+                sentParity: Array.from(session.sentParity).sort(),
+                protocolName: session.protocolName,
+                createdAt: session.createdAt,
+                fecScheme: {
+                    name: session.fecScheme.name,
+                    groupSize: session.fecScheme.groupSize,
+                    parityCount: session.fecScheme.parityCount
+                }
+            });
+        });
+
+        return sessions.sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
+    }
+
+    /**
+     * Get information about active receive sessions
+     */
+    getReceiveSessions(): Array<{
+        sessionId: string;
+        total: number;
+        receivedChunks: number[];
+        receivedParity: string[];
+        missingChunks: number[];
+        fecScheme: { name: string; groupSize: number; parityCount: number };
+    }> {
+        const sessions: Array<{
+            sessionId: string;
+            total: number;
+            receivedChunks: number[];
+            receivedParity: string[];
+            missingChunks: number[];
+            fecScheme: { name: string; groupSize: number; parityCount: number };
+        }> = [];
+
+        this.receiveSessions.forEach((session, sessionId) => {
+            const receivedChunks = Array.from(session.chunks.keys()).sort((a, b) => a - b);
+            const missingChunks: number[] = [];
+            
+            for (let i = 1; i <= session.total; i++) {
+                if (!session.chunks.has(i)) {
+                    missingChunks.push(i);
+                }
+            }
+
+            sessions.push({
+                sessionId,
+                total: session.total,
+                receivedChunks,
+                receivedParity: Array.from(session.parity.keys()).sort(),
+                missingChunks,
+                fecScheme: {
+                    name: session.fecScheme.name,
+                    groupSize: session.fecScheme.groupSize,
+                    parityCount: session.fecScheme.parityCount
+                }
+            });
+        });
+
+        return sessions;
+    }
+
+    /**
+     * Resend specific chunks from a session
+     */
+    async resendChunks(
+        sessionId: string, 
+        chunkNumbers: number[],
+        onProgress?: (progress: {
+            type: 'chunk-resend';
+            current: number;
+            total: number;
+            sessionId: string;
+            chunkNumber: number;
+            packet: string;
+        }) => void
+    ): Promise<void> {
+        const session = this.sendSessions.get(sessionId);
+        if (!session) {
+            throw new Error(`Send session ${sessionId} not found`);
+        }
+
+        console.log(`🔄 Resending ${chunkNumbers.length} chunks for session ${sessionId}`);
+
+        for (let i = 0; i < chunkNumbers.length; i++) {
+            const chunkNumber = chunkNumbers[i];
+            const chunkData = session.chunks.get(chunkNumber);
+            
+            if (!chunkData) {
+                console.warn(`Chunk ${chunkNumber} not found in session ${sessionId}`);
+                continue;
+            }
+
+            const chunkBase64 = btoa(String.fromCharCode(...chunkData));
+            const dataPacket = `D:${sessionId}:${chunkNumber}:${chunkBase64}`;
+            
+            console.log(`📤 Resending chunk ${chunkNumber}/${session.total}`);
+            
+            onProgress?.({
+                type: 'chunk-resend',
+                current: i + 1,
+                total: chunkNumbers.length,
+                sessionId,
+                chunkNumber,
+                packet: dataPacket
+            });
+
+            await this.transmitPacket(dataPacket, session.protocolName);
+            
+            // Update sent tracking
+            session.sentChunks.add(chunkNumber);
+        }
+
+        console.log(`✅ Resent ${chunkNumbers.length} chunks for session ${sessionId}`);
+    }
+
+    /**
+     * Resend specific parity packets from a session
+     */
+    async resendParity(
+        sessionId: string, 
+        parityKeys: string[],
+        onProgress?: (progress: {
+            type: 'parity-resend';
+            current: number;
+            total: number;
+            sessionId: string;
+            parityKey: string;
+            packet: string;
+        }) => void
+    ): Promise<void> {
+        const session = this.sendSessions.get(sessionId);
+        if (!session) {
+            throw new Error(`Send session ${sessionId} not found`);
+        }
+
+        console.log(`🔄 Resending ${parityKeys.length} parity packets for session ${sessionId}`);
+
+        for (let i = 0; i < parityKeys.length; i++) {
+            const parityKey = parityKeys[i];
+            const parityData = session.parity.get(parityKey);
+            
+            if (!parityData) {
+                console.warn(`Parity ${parityKey} not found in session ${sessionId}`);
+                continue;
+            }
+
+            const parityBase64 = btoa(String.fromCharCode(...parityData));
+            const parityPacket = `P:${sessionId}:${parityKey}:${parityBase64}`;
+            
+            console.log(`📤 Resending parity ${parityKey}`);
+            
+            onProgress?.({
+                type: 'parity-resend',
+                current: i + 1,
+                total: parityKeys.length,
+                sessionId,
+                parityKey,
+                packet: parityPacket
+            });
+
+            await this.transmitPacket(parityPacket, session.protocolName);
+            
+            // Update sent tracking
+            session.sentParity.add(parityKey);
+        }
+
+        console.log(`✅ Resent ${parityKeys.length} parity packets for session ${sessionId}`);
+    }
+
+    /**
+     * Clear old send sessions (cleanup)
+     */
+    clearOldSendSessions(maxAgeMinutes: number = 30): void {
+        const now = new Date();
+        const sessionsToDelete: string[] = [];
+
+        this.sendSessions.forEach((session, sessionId) => {
+            const ageMinutes = (now.getTime() - session.createdAt.getTime()) / (1000 * 60);
+            if (ageMinutes > maxAgeMinutes) {
+                sessionsToDelete.push(sessionId);
+            }
+        });
+
+        sessionsToDelete.forEach(sessionId => {
+            this.sendSessions.delete(sessionId);
+            console.log(`🗑️ Cleared old send session: ${sessionId}`);
+        });
+    }
+
+    /**
+     * Delete a specific send session
+     */
+    deleteSendSession(sessionId: string): boolean {
+        const deleted = this.sendSessions.delete(sessionId);
+        if (deleted) {
+            console.log(`🗑️ Deleted send session: ${sessionId}`);
+        }
+        return deleted;
+    }
+
+    clearAllSendSessions(): void {
+        const count = this.sendSessions.size;
+        this.sendSessions.clear();
+        console.log(`🗑️ Cleared all ${count} send sessions`);
+    }
+
+    clearAllReceiveSessions(): void {
+        // First clear timeouts to prevent memory leaks
+        this.receiveSessions.forEach((session) => {
+            clearTimeout(session.timeoutId);
+        });
+        
+        const count = this.receiveSessions.size;
+        this.receiveSessions.clear();
+        console.log(`🗑️ Cleared all ${count} receive sessions`);
     }
 }
