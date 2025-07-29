@@ -29,6 +29,7 @@ export class GGWaveService {
     private static readonly SESSION_TIMEOUT_BASE_MS = 30_000; // base timeout (30s)
     private static readonly SESSION_TIMEOUT_PER_PACKET_MS = 5_000; // per packet timeout (5s per packet)
     private static readonly MIN_SESSION_TIMEOUT_MS = 60_000; // minimum 1 minute timeout
+    private static readonly CHANNEL_SILENCE_TIMEOUT_MS = 10_000; // 10 seconds channel silence before requesting retransmission
     
     // === FEC Configuration ===
     public static readonly FEC_SCHEMES: Record<string, FECScheme> = {
@@ -75,6 +76,9 @@ export class GGWaveService {
         parity: Map<string, Uint8Array>; // "group-type" -> parity bytes
         timeoutId: ReturnType<typeof setTimeout>;
         receivedPackets: Set<string>; // for duplicate detection
+        lastPacketTime: number; // timestamp of last received packet
+        channelTimeoutId?: ReturnType<typeof setTimeout>; // for 10s channel silence detection
+        retransmissionRequested: boolean; // flag to prevent duplicate requests
     }> = new Map();
 
     // Map of active send sessions for selective retransmission
@@ -1022,6 +1026,12 @@ export class GGWaveService {
         if (type === 'FILE') {
             return await this.handleFilePacket(raw);
         }
+        
+        // Handle retransmission requests
+        if (type === 'RETX') {
+            await this.handleRetransmissionRequest(raw);
+            return null; // Don't pass RETX messages to UI
+        }
 
         if (!['S', 'D', 'P', 'E'].includes(type)) {
             return raw; // treat as simple text
@@ -1086,7 +1096,9 @@ export class GGWaveService {
                     chunks: new Map(),
                     parity: new Map(),
                     timeoutId,
-                    receivedPackets: new Set([packetId])
+                    receivedPackets: new Set([packetId]),
+                    lastPacketTime: Date.now(),
+                    retransmissionRequested: false
                 });
                 
                 // Report progress
@@ -1117,6 +1129,10 @@ export class GGWaveService {
                     break;
                 }
                 sess.receivedPackets.add(packetId);
+                
+                // Update timing for channel silence detection
+                sess.lastPacketTime = Date.now();
+                this.resetChannelTimeout(sessionId, sess);
 
                 // Decode Base64 data with validation
                 const dataBytes = GGWaveService.validateAndDecodeBase64(dataBase64);
@@ -1165,6 +1181,10 @@ export class GGWaveService {
                     break;
                 }
                 sess.receivedPackets.add(packetId);
+                
+                // Update timing for channel silence detection
+                sess.lastPacketTime = Date.now();
+                this.resetChannelTimeout(sessionId, sess);
 
                 // Decode Base64 parity with validation
                 const parityBytes = GGWaveService.validateAndDecodeBase64(parityBase64);
@@ -1209,6 +1229,13 @@ export class GGWaveService {
                     break;
                 }
                 sess.receivedPackets.add(packetId);
+                
+                // Update timing for channel silence detection
+                sess.lastPacketTime = Date.now();
+                this.resetChannelTimeout(sessionId, sess);
+                
+                // Check for missing chunks after receiving end packet
+                this.checkForMissingChunks(sessionId, sess);
                 // Report progress
                 if (sess) {
                     const chunksStatus: { [key: number]: boolean } = {};
@@ -1885,10 +1912,132 @@ export class GGWaveService {
         // First clear timeouts to prevent memory leaks
         this.receiveSessions.forEach((session) => {
             clearTimeout(session.timeoutId);
+            if (session.channelTimeoutId) {
+                clearTimeout(session.channelTimeoutId);
+            }
         });
         
         const count = this.receiveSessions.size;
         this.receiveSessions.clear();
         console.log(`🗑️ Cleared all ${count} receive sessions`);
+    }
+    
+    /**
+     * Reset channel timeout for detecting 10-second silence
+     */
+    private resetChannelTimeout(sessionId: string, session: any): void {
+        // Clear existing timeout
+        if (session.channelTimeoutId) {
+            clearTimeout(session.channelTimeoutId);
+        }
+        
+        // Set new timeout for channel silence detection
+        session.channelTimeoutId = setTimeout(() => {
+            this.handleChannelSilence(sessionId);
+        }, GGWaveService.CHANNEL_SILENCE_TIMEOUT_MS);
+    }
+    
+    /**
+     * Handle channel silence timeout (10 seconds without packets)
+     */
+    private handleChannelSilence(sessionId: string): void {
+        const session = this.receiveSessions.get(sessionId);
+        if (!session || session.retransmissionRequested) {
+            return; // Session ended or already requested
+        }
+        
+        console.log(`⚠️ Channel silence detected for session ${sessionId} - requesting retransmission`);
+        this.requestRetransmission(sessionId, session);
+    }
+    
+    /**
+     * Check for missing chunks after receiving end packet
+     */
+    private checkForMissingChunks(sessionId: string, session: any): void {
+        if (session.retransmissionRequested) {
+            return; // Already requested
+        }
+        
+        const missingChunks = [];
+        for (let i = 1; i <= session.total; i++) {
+            if (!session.chunks.has(i)) {
+                missingChunks.push(i);
+            }
+        }
+        
+        if (missingChunks.length > 0) {
+            console.log(`📊 Missing chunks detected after end packet for session ${sessionId}: [${missingChunks.join(', ')}]`);
+            this.requestRetransmission(sessionId, session);
+        }
+    }
+    
+    /**
+     * Send retransmission request to sender
+     */
+    private async requestRetransmission(sessionId: string, session: any): Promise<void> {
+        if (session.retransmissionRequested) {
+            return; // Prevent duplicate requests
+        }
+        
+        session.retransmissionRequested = true;
+        
+        const missingChunks = [];
+        for (let i = 1; i <= session.total; i++) {
+            if (!session.chunks.has(i)) {
+                missingChunks.push(i);
+            }
+        }
+        
+        if (missingChunks.length === 0) {
+            return; // Nothing to request
+        }
+        
+        // Create retransmission request message
+        const requestMessage = `RETX:${sessionId}:${missingChunks.join(',')}`;
+        
+        try {
+            console.log(`🔄 Sending retransmission request for session ${sessionId}: ${missingChunks.length} chunks`);
+            await this.sendMessage(requestMessage);
+        } catch (error) {
+            console.error(`❌ Failed to send retransmission request for session ${sessionId}:`, error);
+            session.retransmissionRequested = false; // Allow retry
+        }
+    }
+    
+    /**
+     * Handle incoming retransmission request from receiver
+     */
+    private async handleRetransmissionRequest(raw: string): Promise<void> {
+        const parts = raw.split(':');
+        if (parts.length < 3) {
+            console.warn(`Invalid retransmission request format: ${raw}`);
+            return;
+        }
+        
+        const sessionId = parts[1];
+        const missingChunksStr = parts[2];
+        
+        const session = this.sendSessions.get(sessionId);
+        if (!session) {
+            console.warn(`⚠️ Retransmission request for unknown session: ${sessionId}`);
+            return;
+        }
+        
+        const missingChunks = missingChunksStr.split(',').map(n => parseInt(n, 10)).filter(n => !isNaN(n));
+        if (missingChunks.length === 0) {
+            console.warn(`No valid chunk numbers in retransmission request: ${missingChunksStr}`);
+            return;
+        }
+        
+        console.log(`📡 Received retransmission request for session ${sessionId}: ${missingChunks.length} chunks`);
+        console.log(`🔄 Missing chunks: [${missingChunks.join(', ')}]`);
+        
+        try {
+            // Resend the missing chunks using existing method
+            await this.resendChunks(sessionId, missingChunks);
+            console.log(`✅ Successfully resent ${missingChunks.length} chunks for session ${sessionId}`);
+        } catch (error) {
+            console.error(`❌ Failed to resend chunks for session ${sessionId}:`, error);
+        }
     }
 }
